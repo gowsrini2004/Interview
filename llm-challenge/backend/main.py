@@ -1,8 +1,8 @@
 import os
 import uuid
 import json
-from datetime import datetime, timedelta
-from typing import List, Optional, Literal
+from datetime import datetime, timedelta, date
+from typing import List, Optional, Literal, Dict, Any
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from passlib.context import CryptContext
 import jwt
@@ -47,6 +47,10 @@ GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 _groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
+
+# Questionnaire rules
+MIN_QUESTIONS = 10           # minimum to reach before offering score
+CONTINUE_STEP = 3            # increment each time user says "continue"
 
 # ---------------- DB ----------------
 engine = create_engine(
@@ -89,6 +93,28 @@ class Document(Base):
     uploader = Column(String(255))
     filename = Column(String(255))
     uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+
+class QuestionnaireAttempt(Base):
+    __tablename__ = "q_attempts"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    day = Column(String(10), index=True)  # yyyy-mm-dd
+    score = Column(Float)
+    comment = Column(Text)
+    tips_json = Column(Text)  # JSON list of strings
+    session_id = Column(String(36))  # link to its conversation (optional)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# NEW: QuestionnaireSession to manage target question count and active flag
+class QuestionnaireSession(Base):
+    __tablename__ = "q_sessions"
+    session_id = Column(String(36), primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    target_questions = Column(Integer, default=MIN_QUESTIONS)
+    is_active = Column(Integer, default=1)  # 1 = active, 0 = closed
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -228,12 +254,11 @@ def search_qdrant(query: str, limit: int = TOP_K) -> List[dict]:
     return results
 
 
-# ---------------- helpers ----------------
+# ---------------- helpers: sources as excerpts ----------------
 SOURCES_MARKER_PREFIX = "<!--SOURCES_JSON:"
 SOURCES_MARKER_SUFFIX = "-->"
 
 def build_source_items(contexts: List[dict]) -> List[dict]:
-    """Return [{filename, excerpt}] from qdrant contexts."""
     items = []
     for c in contexts:
         meta = c.get("meta") or {}
@@ -256,12 +281,7 @@ def call_ollama(prompt: str, num_predict: int = 512) -> str:
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": OLLAMA_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "options": {"num_predict": num_predict},
-            },
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"num_predict": num_predict}},
             timeout=600,
         )
         resp.raise_for_status()
@@ -321,27 +341,54 @@ class ChatIn(BaseModel):
 
 class ChatOut(BaseModel):
     reply: str
-    # still return structured sources if you want to inspect/debug in UI
     sources: List[dict] = Field(default_factory=list)
 
 class UpdateTitleIn(BaseModel):
     title: str
 
+# Questionnaire
+class QStartOut(BaseModel):
+    session_id: str
+    question: str
 
-# ---------------- Routes ----------------
+class QAnswerIn(BaseModel):
+    session_id: str
+    answer: str
+
+class QAnswerOut(BaseModel):
+    done: bool
+    question: Optional[str] = None
+    score: Optional[float] = None
+    comment: Optional[str] = None
+    tips: List[str] = Field(default_factory=list)
+
+
+# ---------------- helpers: titles, username ----------------
+def short_title(text: str) -> str:
+    t = (text or "").strip().replace("\n", " ")
+    if not t: return "New Chat"
+    words = t.split()
+    s = " ".join(words[:8])
+    if len(words) > 8: s += "…"
+    return s[:80]
+
+def username_from_email(email: str) -> str:
+    return (email or "").split("@", 1)[0] or "there"
+
+
+# ---------------- Routes: meta ----------------
 @app.get("/health")
-def health():
+def health(user: User = Depends(get_current_user)):
     return {
         "ok": True,
         "qdrant": init_qdrant() is not None,
         "embedder": init_embedder() is not None,
-        "provider_defaults": {
-            "mistral": OLLAMA_MODEL,
-            "groq": GROQ_MODEL_DEFAULT if GROQ_API_KEY else None,
-        },
+        "me": {"email": user.email, "username": username_from_email(user.email)},
+        "provider_defaults": {"mistral": OLLAMA_MODEL, "groq": GROQ_MODEL_DEFAULT if GROQ_API_KEY else None},
     }
 
 
+# ---------------- Auth ----------------
 @app.post("/auth/register")
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == payload.email).first()
@@ -349,11 +396,8 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email already registered. Please log in instead.")
     user = User(email=payload.email, password_hash=hash_password(payload.password))
     db.add(user); db.commit(); db.refresh(user)
-    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
-    db.add(conv); db.commit()
     token = create_access_token(user.email)
     return {"access_token": token, "token_type": "bearer"}
-
 
 @app.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
@@ -363,38 +407,20 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     token = create_access_token(user.email)
     return {"access_token": token, "token_type": "bearer"}
 
-
+# Aliases
 @app.post("/register")
 def register_alias(payload: RegisterIn, db: Session = Depends(get_db)):
     return register(payload, db)
-
 @app.post("/login")
 def login_alias(payload: LoginIn, db: Session = Depends(get_db)):
     return login(payload, db)
 
 
-@app.post("/sessions/create")
-def create_session(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
-    db.add(conv); db.commit()
-    return {"id": conv.id, "title": conv.title}
-
-
-@app.patch("/sessions/{session_id}")
-def update_session_title(session_id: str, payload: UpdateTitleIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    conv = db.query(Conversation).filter(Conversation.id == session_id, Conversation.user_id == user.id).first()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Session not found")
-    conv.title = payload.title[:255]
-    db.commit()
-    return {"id": conv.id, "title": conv.title}
-
-
+# ---------------- Sessions/Chats ----------------
 @app.get("/sessions")
 def list_sessions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).all()
     return [{"id": r.id, "title": r.title, "created_at": r.created_at.isoformat()} for r in rows]
-
 
 @app.get("/sessions/{session_id}/messages")
 def session_messages(session_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -406,7 +432,17 @@ def session_messages(session_id: str, user: User = Depends(get_current_user), db
     )
     return [{"role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in msgs]
 
+@app.patch("/sessions/{session_id}")
+def update_session_title(session_id: str, payload: UpdateTitleIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    conv = db.query(Conversation).filter(Conversation.id == session_id, Conversation.user_id == user.id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Session not found")
+    conv.title = payload.title[:255]
+    db.commit()
+    return {"id": conv.id, "title": conv.title}
 
+
+# ---------------- Ingest ----------------
 @app.post("/ingest")
 def ingest(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not file.filename.lower().endswith(".txt"):
@@ -419,28 +455,42 @@ def ingest(file: UploadFile = File(...), user: User = Depends(get_current_user),
     return {"ok": True, "ingested_chunks": count}
 
 
-def _short_title_from_text(text: str) -> str:
-    t = (text or "").strip().replace("\n", " ")
-    if not t:
-        return "New Chat"
-    words = t.split()
-    s = " ".join(words[:8])
-    if len(words) > 8:
-        s += "…"
-    return s[:80]
+# ---------------- Chat (no session created until first message) ----------------
+def build_prompt(body_message: str, contexts: List[dict]) -> str:
+    system_prompt = (
+        "You are a compassionate, knowledgeable mental wellness assistant. Give well-structured, practical, "
+        "non-clinical advice. If content refers to documented sources, cite them as [source1], [source2], etc. "
+        "If user is in crisis, advise contacting local emergency services."
+    )
+    best_score = max((c["score"] for c in contexts), default=0.0)
+    is_out = best_score < OUT_OF_CONTEXT_THRESHOLD
 
+    if is_out or not contexts:
+        return (
+            f"SYSTEM:\n{system_prompt}\n\n"
+            f"USER:\n{body_message}\n\n"
+            "ASSISTANT:\nProvide a clear, supportive answer. "
+            "Note: This answer is based on general knowledge and not from your uploaded documents."
+        )
+    MAX_CTX = 2000
+    used = 0; blocks = []
+    for i, c in enumerate(contexts[:TOP_K], start=1):
+        meta = c.get("meta", {})
+        src = meta.get("filename") or meta.get("uploader") or c.get("id")
+        text = (c["text"] or "")[:800]
+        block = f"[source{i}] filename={src} score={c['score']:.4f}\n{text}"
+        if used + len(block) > MAX_CTX: break
+        blocks.append(block); used += len(block)
+    ctx = "\n\n".join(blocks)
+    return (
+        f"SYSTEM:\n{system_prompt}\n\n"
+        f"CONTEXT:\n{ctx}\n\n"
+        f"USER:\n{body_message}\n\n"
+        "ASSISTANT:\nUse the context above; cite like [source1]."
+    )
 
 @app.post("/chat", response_model=ChatOut)
 def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # ensure session
-    conv_id = body.session_id
-    if not conv_id:
-        conv = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).first()
-        if not conv:
-            conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
-            db.add(conv); db.commit()
-        conv_id = conv.id
-
     # RAG search
     try:
         contexts = search_qdrant(body.message, limit=TOP_K)
@@ -448,85 +498,33 @@ def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Dep
         print("[RAG] search error:", e, traceback.format_exc())
         contexts = []
 
-    best_score = max((c["score"] for c in contexts), default=0.0)
-    is_out = best_score < OUT_OF_CONTEXT_THRESHOLD
-
-    system_prompt = (
-        "You are a compassionate, knowledgeable mental wellness assistant. Give well-structured, practical, "
-        "non-clinical advice. If content refers to documented sources, cite them as [source1], [source2], etc. "
-        "If user is in crisis, advise contacting local emergency services."
-    )
-
-    if is_out or not contexts:
-        prompt = (
-            f"SYSTEM:\n{system_prompt}\n\n"
-            f"USER:\n{body.message}\n\n"
-            "ASSISTANT:\nProvide a clear, supportive answer. "
-            "Note: This answer is based on general knowledge and not from your uploaded documents."
-        )
-    else:
-        MAX_CTX = 2000
-        used = 0
-        blocks = []
-        for i, c in enumerate(contexts[:TOP_K], start=1):
-            meta = c.get("meta", {})
-            src = meta.get("filename") or meta.get("uploader") or c.get("id")
-            text = (c["text"] or "")[:800]
-            block = f"[source{i}] filename={src} score={c['score']:.4f}\n{text}"
-            if used + len(block) > MAX_CTX:
-                break
-            blocks.append(block); used += len(block)
-        ctx = "\n\n".join(blocks)
-        prompt = (
-            f"SYSTEM:\n{system_prompt}\n\n"
-            f"CONTEXT:\n{ctx}\n\n"
-            f"USER:\n{body.message}\n\n"
-            "ASSISTANT:\nUse the context above; cite like [source1]."
-        )
-
-    # route provider
-    provider = (body.provider or "mistral").lower()
+    prompt = build_prompt(body.message, contexts)
     max_toks = body.num_predict or 512
-    reply = call_groq(prompt, num_predict=max_toks) if provider == "groq" else call_ollama(prompt, num_predict=max_toks)
-
-    # append invisible sources JSON marker (excerpts)
+    reply = call_groq(prompt, num_predict=max_toks) if body.provider == "groq" else call_ollama(prompt, num_predict=max_toks)
     reply_with_marker = append_sources_marker(reply, contexts)
 
-    # save + auto-title
+    # Create a conversation ONLY NOW (first message), if missing
+    conv_id = body.session_id
+    if not conv_id:
+        conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title=short_title(body.message))
+        db.add(conv); db.commit(); conv_id = conv.id
+
+    # save
     try:
         db.add_all([
             Message(conversation_id=conv_id, user_id=user.id, role="user", content=body.message),
             Message(conversation_id=conv_id, user_id=user.id, role="assistant", content=reply_with_marker),
         ])
-        conv = db.query(Conversation).filter(Conversation.id == conv_id, Conversation.user_id == user.id).first()
-        if conv and (not conv.title or conv.title in ("New Chat", "Welcome Chat")):
-            conv.title = _short_title_from_text(body.message)
         db.commit()
     except Exception as e:
         print("[DB] save failed:", e, traceback.format_exc())
 
-    # still return structured sources for convenience (UI may ignore)
     return {"reply": reply_with_marker, "sources": build_source_items(contexts)}
 
 
 @app.post("/chat_stream")
 def chat_stream(body: ChatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Streams JSON lines:
-      {"type":"delta","text":"..."}  (many)
-      {"type":"done"}
-    The final delta contains the hidden <!--SOURCES_JSON:...--> marker appended.
-    """
     def gen():
-        # ensure session
-        conv_id = body.session_id
-        if not conv_id:
-            conv = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).first()
-            if not conv:
-                conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
-                db.add(conv); db.commit()
-            conv_id = conv.id
-
         # RAG search
         try:
             contexts = search_qdrant(body.message, limit=TOP_K)
@@ -534,60 +532,19 @@ def chat_stream(body: ChatIn, user: User = Depends(get_current_user), db: Sessio
             print("[RAG] search error:", e, traceback.format_exc())
             contexts = []
 
-        best_score = max((c["score"] for c in contexts), default=0.0)
-        is_out = best_score < OUT_OF_CONTEXT_THRESHOLD
-
-        system_prompt = (
-            "You are a compassionate, knowledgeable mental wellness assistant. Give well-structured, practical, "
-            "non-clinical advice. If content refers to documented sources, cite them as [source1], [source2], etc. "
-            "If user is in crisis, advise contacting local emergency services."
-        )
-
-        if is_out or not contexts:
-            prompt = (
-                f"SYSTEM:\n{system_prompt}\n\n"
-                f"USER:\n{body.message}\n\n"
-                "ASSISTANT:\nProvide a clear, supportive answer. "
-                "Note: This answer is based on general knowledge and not from your uploaded documents."
-            )
-        else:
-            MAX_CTX = 2000
-            used = 0
-            blocks = []
-            for i, c in enumerate(contexts[:TOP_K], start=1):
-                meta = c.get("meta", {})
-                src = meta.get("filename") or meta.get("uploader") or c.get("id")
-                text = (c["text"] or "")[:800]
-                block = f"[source{i}] filename={src} score={c['score']:.4f}\n{text}"
-                if used + len(block) > MAX_CTX:
-                    break
-                blocks.append(block); used += len(block)
-            ctx = "\n\n".join(blocks)
-            prompt = (
-                f"SYSTEM:\n{system_prompt}\n\n"
-                f"CONTEXT:\n{ctx}\n\n"
-                f"USER:\n{body.message}\n\n"
-                "ASSISTANT:\nUse the context above; cite like [source1]."
-            )
-
-        provider = (body.provider or "mistral").lower()
+        prompt = build_prompt(body.message, contexts)
         max_toks = body.num_predict or 512
 
         chunks: List[str] = []
         try:
-            if provider == "groq":
+            if body.provider == "groq":
                 if not _groq_client:
                     yield json.dumps({"type":"delta","text":"[Groq key missing]\n"}) + "\n"
                 else:
                     stream = _groq_client.chat.completions.create(
                         model=GROQ_MODEL_DEFAULT,
-                        messages=[
-                            {"role": "system", "content": "You are a helpful, compassionate assistant."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        max_tokens=max_toks,
-                        temperature=0.2,
-                        stream=True,
+                        messages=[{"role":"system","content":"You are a helpful, compassionate assistant."},{"role":"user","content":prompt}],
+                        max_tokens=max_toks, temperature=0.2, stream=True,
                     )
                     for chunk in stream:
                         d = ""
@@ -600,17 +557,13 @@ def chat_stream(body: ChatIn, user: User = Depends(get_current_user), db: Sessio
                 with requests.post(
                     f"{OLLAMA_URL}/api/generate",
                     json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True, "options": {"num_predict": max_toks}},
-                    stream=True,
-                    timeout=600,
+                    stream=True, timeout=600,
                 ) as r:
                     r.raise_for_status()
                     for line in r.iter_lines(decode_unicode=True):
-                        if not line:
-                            continue
-                        try:
-                            ev = json.loads(line)
-                        except Exception:
-                            continue
+                        if not line: continue
+                        try: ev = json.loads(line)
+                        except Exception: continue
                         d = ev.get("response")
                         if d:
                             chunks.append(d)
@@ -621,26 +574,229 @@ def chat_stream(body: ChatIn, user: User = Depends(get_current_user), db: Sessio
             final_text = "".join(chunks)
             final_text_with_marker = append_sources_marker(final_text, contexts)
 
+            # Create conversation only now (first message), if missing
+            conv_id = body.session_id
+            if not conv_id:
+                conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title=short_title(body.message))
+                db.add(conv); db.commit(); conv_id = conv.id
+
             try:
                 db.add_all([
                     Message(conversation_id=conv_id, user_id=user.id, role="user", content=body.message),
                     Message(conversation_id=conv_id, user_id=user.id, role="assistant", content=final_text_with_marker),
                 ])
-                conv = db.query(Conversation).filter(Conversation.id == conv_id, Conversation.user_id == user.id).first()
-                if conv and (not conv.title or conv.title in ("New Chat", "Welcome Chat")):
-                    conv.title = _short_title_from_text(body.message)
                 db.commit()
             except Exception as e:
                 print("[DB] save failed (stream):", e, traceback.format_exc())
 
-            # also show the marker at the end of the stream so UI can render sources immediately
             yield json.dumps({"type":"delta","text": final_text_with_marker[len(final_text):]}) + "\n"
             yield json.dumps({"type":"done"}) + "\n"
 
     return StreamingResponse(gen(), media_type="application/jsonl")
 
 
-if __name__ == "__main__":
-    import uvicorn
-    print("Starting app — Groq SDK enabled; sources embedded as excerpts via hidden marker.")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+# ---------------- Questionnaire logic ----------------
+Q_MARK = "<!--Q-->"                    # tag assistant questions
+CONTINUE_PROMPT_MARK = "<!--CONTINUE_PROMPT-->"  # tag "continue or score?" prompt
+
+def q_system_prompt() -> str:
+    return (
+        "You are a licensed-therapist-style assistant creating an adaptive mental-health questionnaire. "
+        "Ask concise, empathetic questions. Use the user's previous answers to decide the next question. "
+        "Do not give scores until asked. Keep each question short and clear."
+    )
+
+def q_history(db: Session, user_id: int, session_id: str) -> List[Dict[str, str]]:
+    msgs = (
+        db.query(Message)
+        .filter(Message.conversation_id == session_id, Message.user_id == user_id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    return [{"role": m.role, "content": m.content} for m in msgs]
+
+def _extract_qa_transcript(history_pairs: List[Dict[str, str]]) -> List[str]:
+    t = []
+    for m in history_pairs:
+        if m["role"] == "assistant":
+            # Strip markers if present
+            c = m["content"].replace(Q_MARK, "").replace(CONTINUE_PROMPT_MARK, "").strip()
+            t.append(f"Q: {c}")
+        else:
+            t.append(f"A: {m['content']}")
+    return t
+
+def next_question_from_llm(history_pairs: List[Dict[str, str]]) -> str:
+    transcript = "\n".join(_extract_qa_transcript(history_pairs))
+    prompt = (
+        q_system_prompt() +
+        "\n\nTRANSCRIPT:\n" + transcript +
+        "\n\nProduce ONLY the next question (no preface, no JSON, no commentary)."
+    )
+    text = call_groq(prompt, num_predict=120) if _groq_client else call_ollama(prompt, num_predict=120)
+    # take first line as question
+    q = (text or "").strip().split("\n")[0].strip()
+    if not q.endswith("?"): q += "?"
+    return q
+
+def finalize_score_from_history(history_pairs: List[Dict[str, str]]) -> Dict[str, Any]:
+    transcript = "\n".join(_extract_qa_transcript(history_pairs))
+    prompt = (
+        "Analyze the conversation transcript and output JSON ONLY with keys:\n"
+        "{\"score\": <0-100>, \"comment\": \"...\", \"tips\": [\"...\", \"...\"]}\n"
+        "Be concise, empathetic, and actionable.\n\nTRANSCRIPT:\n" + transcript + "\n\nJSON:"
+    )
+    text = call_groq(prompt, num_predict=400) if _groq_client else call_ollama(prompt, num_predict=400)
+    try:
+        start = text.find("{"); end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            data = json.loads(text[start:end+1])
+            data["score"] = float(data.get("score", 0.0))
+            if not isinstance(data.get("tips"), list):
+                data["tips"] = []
+            return data
+    except Exception:
+        pass
+    return {"score": 50.0, "comment": "Neutral mood with mixed stress signals.", "tips": ["Take a short walk", "Practice 5-minute breathing"]}
+
+
+@app.post("/questionnaire/start", response_model=QStartOut)
+def questionnaire_start(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Create a new conversation
+    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title=f"[Questionnaire] {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}")
+    db.add(conv); db.commit()
+    # Create q_session row with target = MIN_QUESTIONS
+    qs = QuestionnaireSession(session_id=conv.id, user_id=user.id, target_questions=MIN_QUESTIONS, is_active=1)
+    db.add(qs); db.commit()
+    # First question
+    first_q = "To get started, how would you describe your overall mood today?" + Q_MARK
+    db.add(Message(conversation_id=conv.id, user_id=user.id, role="assistant", content=first_q))
+    db.commit()
+    return {"session_id": conv.id, "question": first_q.replace(Q_MARK, "")}
+
+
+@app.post("/questionnaire/answer", response_model=QAnswerOut)
+def questionnaire_answer(body: QAnswerIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Append user answer
+    db.add(Message(conversation_id=body.session_id, user_id=user.id, role="user", content=body.answer))
+    db.commit()
+
+    # Fetch session settings
+    qs = db.query(QuestionnaireSession).filter(
+        QuestionnaireSession.session_id == body.session_id,
+        QuestionnaireSession.user_id == user.id
+    ).first()
+    if not qs or not qs.is_active:
+        raise HTTPException(status_code=400, detail="Questionnaire session not active.")
+
+    # Load history
+    hist = q_history(db, user.id, body.session_id)
+
+    # Determine if the latest answer was to a CONTINUE prompt
+    # Find the last assistant message before this user answer
+    last_assistant = None
+    for m in reversed(hist[:-1]):  # exclude the just-added user message
+        if m["role"] == "assistant":
+            last_assistant = m["content"]
+            break
+
+    # Count "actual" questions asked so far (assistant messages with Q_MARK)
+    actual_q_count = sum(1 for m in hist if m["role"] == "assistant" and Q_MARK in m["content"])
+
+    # If last assistant was the continue prompt, interpret the user's answer:
+    if last_assistant and CONTINUE_PROMPT_MARK in last_assistant:
+        ans = (body.answer or "").strip().lower()
+        wants_continue = any(x in ans for x in ["continue", "yes", "y", "go on", "more", "add"])
+        if wants_continue:
+            # bump target by 3 and ask next adaptive question
+            qs.target_questions = (qs.target_questions or MIN_QUESTIONS) + CONTINUE_STEP
+            db.commit()
+            q = next_question_from_llm(hist) + Q_MARK
+            db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=q))
+            db.commit()
+            return {"done": False, "question": q.replace(Q_MARK, "")}
+        else:
+            # finalize now
+            data = finalize_score_from_history(hist)
+            score = float(data.get("score", 0.0))
+            comment = data.get("comment") or ""
+            tips = data.get("tips") or []
+            summary_text = f"**Summary**\nScore: {score:.1f}/100\n\n{comment}\n\nTips:\n" + "\n".join([f"- {t}" for t in tips])
+            db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=summary_text))
+            # save attempt
+            today = date.today().isoformat()
+            db.add(QuestionnaireAttempt(
+                user_id=user.id, day=today, score=score, comment=comment, tips_json=json.dumps(tips), session_id=body.session_id
+            ))
+            qs.is_active = 0
+            db.commit()
+            return {"done": True, "score": score, "comment": comment, "tips": tips}
+
+    # If we reached at least target questions -> ask for continue or score
+    if actual_q_count >= (qs.target_questions or MIN_QUESTIONS):
+        prompt = (
+            f"You've answered {actual_q_count} questions so far. "
+            f"Would you like to **continue** with {CONTINUE_STEP} more questions, or **get your score** now? "
+            "Reply with 'continue' or 'score'."
+        ) + CONTINUE_PROMPT_MARK
+        db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=prompt))
+        db.commit()
+        return {"done": False, "question": "continue or score?"}
+
+    # Otherwise: ask next adaptive question
+    q = next_question_from_llm(hist) + Q_MARK
+    db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=q))
+    db.commit()
+    return {"done": False, "question": q.replace(Q_MARK, "")}
+
+
+# ---------------- Questionnaire dashboard (fast) ----------------
+class QDashItem(BaseModel):
+    day: str
+    attempts: int
+    avg_score: float
+    latest_comment: Optional[str] = None
+
+@app.get("/questionnaire/dashboard", response_model=List[QDashItem])
+def questionnaire_dashboard(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # AVG + COUNT per day
+    agg_rows = (
+        db.query(
+            QuestionnaireAttempt.day.label("day"),
+            func.count(QuestionnaireAttempt.id).label("attempts"),
+            func.avg(QuestionnaireAttempt.score).label("avg_score"),
+        )
+        .filter(QuestionnaireAttempt.user_id == user.id)
+        .group_by(QuestionnaireAttempt.day)
+        .order_by(desc(QuestionnaireAttempt.day))
+        .all()
+    )
+
+    # Latest comment per day (using max created_at)
+    sub_latest = (
+        db.query(
+            QuestionnaireAttempt.day.label("day"),
+            func.max(QuestionnaireAttempt.created_at).label("max_ts"),
+        )
+        .filter(QuestionnaireAttempt.user_id == user.id)
+        .group_by(QuestionnaireAttempt.day)
+        .subquery()
+    )
+
+    latest_rows = (
+        db.query(QuestionnaireAttempt.day, QuestionnaireAttempt.comment)
+        .join(sub_latest, (QuestionnaireAttempt.day == sub_latest.c.day) & (QuestionnaireAttempt.created_at == sub_latest.c.max_ts))
+        .filter(QuestionnaireAttempt.user_id == user.id)
+        .all()
+    )
+    latest_map = {d: c for d, c in latest_rows}
+
+    out = []
+    for r in agg_rows:
+        out.append({
+            "day": r.day,
+            "attempts": int(r.attempts or 0),
+            "avg_score": round(float(r.avg_score or 0.0), 2),
+            "latest_comment": latest_map.get(r.day, None),
+        })
+    return out
