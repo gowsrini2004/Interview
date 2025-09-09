@@ -1,14 +1,18 @@
+#working
 import os
 import uuid
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Literal
+
+from dotenv import load_dotenv
+load_dotenv()  # load .env before reading env vars
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from passlib.context import CryptContext
 import jwt
 import requests
@@ -19,24 +23,38 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 from sentence_transformers import SentenceTransformer
 
+# Groq SDK
+from groq import Groq
+
 # ---------------- CONFIG ----------------
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change")  # set a strong key in prod!
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "240"))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./psych_support.db")
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.getenv("COLLECTION_NAME", "psych_docs")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-TOP_K = int(os.getenv("RAG_TOP_K", "4"))
+TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 OUT_OF_CONTEXT_THRESHOLD = float(os.getenv("OUT_OF_CONTEXT_THRESHOLD", "0.22"))
 
+# Providers
+# Ollama (local Mistral)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
+
+# Groq (official Python SDK)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+# Single global client (safe to reuse)
+_groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
 
 # ---------------- DB ----------------
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -114,7 +132,9 @@ def decode_token(token: str) -> str:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
-def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)) -> User:
+def get_current_user(
+    creds: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)
+) -> User:
     token = creds.credentials
     email = decode_token(token)
     user = db.query(User).filter(User.email == email).first()
@@ -123,7 +143,7 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer), db: 
     return user
 
 
-# ---------------- RAG initialization (lazy, robust) ----------------
+# ---------------- RAG ----------------
 _qdrant: Optional[QdrantClient] = None
 _embedder: Optional[SentenceTransformer] = None
 
@@ -148,7 +168,6 @@ def init_qdrant() -> Optional[QdrantClient]:
         return _qdrant
     try:
         _qdrant = QdrantClient(url=QDRANT_URL)
-        # ensure collection exists
         try:
             _qdrant.get_collection(COLLECTION)
         except Exception:
@@ -183,12 +202,13 @@ def upsert_documents_to_qdrant(payloads: List[dict]) -> int:
     vectors = embed_texts([p["text"] for p in payloads])
     points = []
     for i, p in enumerate(payloads):
-        pts = qmodels.PointStruct(
-            id=p["id"],
-            vector=vectors[i],
-            payload={"text": p["text"], "meta": p.get("meta", {})},
+        points.append(
+            qmodels.PointStruct(
+                id=p["id"],
+                vector=vectors[i],
+                payload={"text": p["text"], "meta": p.get("meta", {})},
+            )
         )
-        points.append(pts)
     qc.upsert(collection_name=COLLECTION, points=points)
     return len(points)
 
@@ -201,39 +221,67 @@ def search_qdrant(query: str, limit: int = TOP_K) -> List[dict]:
     hits = qc.search(collection_name=COLLECTION, query_vector=qvec, limit=limit)
     results = []
     for h in hits:
-        results.append(
-            {
-                "id": str(h.id),
-                "text": h.payload.get("text", ""),
-                "meta": h.payload.get("meta", {}),
-                "score": float(h.score) if h.score is not None else 0.0,
-            }
-        )
+        results.append({
+            "id": str(h.id),
+            "text": h.payload.get("text", ""),
+            "meta": h.payload.get("meta", {}),
+            "score": float(h.score) if h.score is not None else 0.0,
+        })
     return results
 
 
-# ---------------- LLM (Ollama) call ----------------
-def call_ollama(prompt: str, num_predict: int = 512, stream: bool = False) -> str:
+# ---------------- LLMs ----------------
+
+def call_ollama(prompt: str, num_predict: int = 192) -> str:
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
-                "stream": stream,
+                "stream": False,
                 "options": {"num_predict": num_predict},
             },
-            timeout=120,
+            timeout=300,
         )
         resp.raise_for_status()
         data = resp.json()
         return data.get("response") or data.get("text") or ""
+    except requests.exceptions.Timeout:
+        return "The local model (Mistral) timed out. For big questions, switch provider to Groq."
     except Exception as e:
         print("[LLM] Ollama call failed:", e)
-        return "I'm sorry — the LLM is not available right now. Try again later."
+        return "Local model is not available right now."
 
 
-# ---------------- FastAPI app ----------------
+def call_groq(prompt: str, num_predict: int = 192) -> str:
+    """Call Groq using the official Python SDK."""
+    global _groq_client
+    if not GROQ_API_KEY:
+        return "Groq API key not configured. Add GROQ_API_KEY to .env."
+    if _groq_client is None:
+        try:
+            _groq_client = Groq(api_key=GROQ_API_KEY)
+        except Exception as e:
+            print("[LLM] Failed to init Groq client:", e)
+            return "Groq client initialization failed."
+    try:
+        chat_completion = _groq_client.chat.completions.create(
+            model=GROQ_MODEL_DEFAULT,
+            messages=[
+                {"role": "system", "content": "You are a helpful, compassionate assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=num_predict,
+            temperature=0.2,
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        print("[LLM] Groq SDK call failed:", e)
+        return "Groq API is not available right now."
+
+
+# ---------------- FastAPI ----------------
 app = FastAPI(title="Psych Support - RAG Chat")
 app.add_middleware(
     CORSMiddleware,
@@ -249,28 +297,36 @@ class RegisterIn(BaseModel):
     email: EmailStr
     password: str
 
-
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
 
-
 class ChatIn(BaseModel):
     message: str
     session_id: Optional[str] = None
-    num_predict: Optional[int] = 512
-
+    num_predict: Optional[int] = 192
+    provider: Literal["mistral", "groq"] = "mistral"  # only provider name
 
 class ChatOut(BaseModel):
     reply: str
     sources: List[dict] = Field(default_factory=list)
 
+class UpdateTitleIn(BaseModel):
+    title: str
 
-# ---------------- Routes (auth, sessions, ingest, chat, history) ----------------
+
+# ---------------- Routes ----------------
 @app.get("/health")
 def health():
-    return {"ok": True, "qdrant": init_qdrant() is not None, "embedder": init_embedder() is not None}
-
+    return {
+        "ok": True,
+        "qdrant": init_qdrant() is not None,
+        "embedder": init_embedder() is not None,
+        "provider_defaults": {
+            "mistral": OLLAMA_MODEL,
+            "groq": GROQ_MODEL_DEFAULT if GROQ_API_KEY else None,
+        },
+    }
 
 @app.post("/auth/register")
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
@@ -278,16 +334,11 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered. Please log in instead.")
     user = User(email=payload.email, password_hash=hash_password(payload.password))
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    # create default conversation for this user
-    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="Welcome Chat")
-    db.add(conv)
-    db.commit()
+    db.add(user); db.commit(); db.refresh(user)
+    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
+    db.add(conv); db.commit()
     token = create_access_token(user.email)
     return {"access_token": token, "token_type": "bearer"}
-
 
 @app.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
@@ -297,37 +348,33 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     token = create_access_token(user.email)
     return {"access_token": token, "token_type": "bearer"}
 
-
-# ---- Compatibility aliases so frontend can call /register and /login ----
 @app.post("/register")
 def register_alias(payload: RegisterIn, db: Session = Depends(get_db)):
     return register(payload, db)
-
 
 @app.post("/login")
 def login_alias(payload: LoginIn, db: Session = Depends(get_db)):
     return login(payload, db)
 
-
 @app.post("/sessions/create")
-def create_session(title: Optional[str] = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    title = title or f"Chat {datetime.utcnow().isoformat(timespec='seconds')}"
-    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title=title)
-    db.add(conv)
+def create_session(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
+    db.add(conv); db.commit()
+    return {"id": conv.id, "title": conv.title}
+
+@app.patch("/sessions/{session_id}")
+def update_session_title(session_id: str, payload: UpdateTitleIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    conv = db.query(Conversation).filter(Conversation.id == session_id, Conversation.user_id == user.id).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Session not found")
+    conv.title = payload.title[:255]
     db.commit()
     return {"id": conv.id, "title": conv.title}
 
-
 @app.get("/sessions")
 def list_sessions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = (
-        db.query(Conversation)
-        .filter(Conversation.user_id == user.id)
-        .order_by(Conversation.created_at.desc())
-        .all()
-    )
+    rows = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).all()
     return [{"id": r.id, "title": r.title, "created_at": r.created_at.isoformat()} for r in rows]
-
 
 @app.get("/sessions/{session_id}/messages")
 def session_messages(session_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -339,53 +386,40 @@ def session_messages(session_id: str, user: User = Depends(get_current_user), db
     )
     return [{"role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in msgs]
 
-
 @app.post("/ingest")
 def ingest(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Accepts .txt files, splits to chunks, embeds and upserts to Qdrant."""
-    fn = file.filename.lower()
-    if not fn.endswith(".txt"):
-        raise HTTPException(status_code=400, detail="Only .txt supported in this minimal starter.")
+    if not file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="Only .txt supported.")
     raw = file.file.read().decode("utf-8", errors="ignore")
-    # naive chunking (800 chars)
-    chunks = [raw[i:i + 800].strip() for i in range(0, len(raw), 800) if raw[i:i + 800].strip()]
-    payloads = []
-    for c in chunks:
-        doc_id = str(uuid.uuid4())
-        payloads.append({"id": doc_id, "text": c, "meta": {"uploader": user.email, "filename": file.filename}})
-    # persist doc row
-    doc_row = Document(id=str(uuid.uuid4()), uploader=user.email, filename=file.filename)
-    db.add(doc_row)
-    db.commit()
+    chunks = [raw[i:i+800].strip() for i in range(0, len(raw), 800) if raw[i:i+800].strip()]
+    payloads = [{"id": str(uuid.uuid4()), "text": c, "meta": {"uploader": user.email, "filename": file.filename}} for c in chunks]
+    db.add(Document(id=str(uuid.uuid4()), uploader=user.email, filename=file.filename)); db.commit()
     count = upsert_documents_to_qdrant(payloads)
     return {"ok": True, "ingested_chunks": count}
 
 
+def _short_title_from_text(text: str) -> str:
+    t = (text or "").strip().replace("\n", " ")
+    if not t:
+        return "New Chat"
+    words = t.split()
+    s = " ".join(words[:8])
+    if len(words) > 8:
+        s += "…"
+    return s[:80]
+
 @app.post("/chat", response_model=ChatOut)
 def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    RAG flow:
-    1. embed query
-    2. search Qdrant top-k
-    3. if best score < threshold -> general answer
-    4. else build prompt with retrieved contexts
-    """
-    # Ensure session exists; fallback to user's most recent
+    # ensure session
     conv_id = body.session_id
     if not conv_id:
-        conv = (
-            db.query(Conversation)
-            .filter(Conversation.user_id == user.id)
-            .order_by(Conversation.created_at.desc())
-            .first()
-        )
+        conv = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).first()
         if not conv:
-            conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="Default")
-            db.add(conv)
-            db.commit()
+            conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
+            db.add(conv); db.commit()
         conv_id = conv.id
 
-    # Retrieve contexts
+    # RAG search
     try:
         contexts = search_qdrant(body.message, limit=TOP_K)
     except Exception as e:
@@ -393,7 +427,7 @@ def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Dep
         contexts = []
 
     best_score = max((c["score"] for c in contexts), default=0.0)
-    is_out_of_context = best_score < OUT_OF_CONTEXT_THRESHOLD
+    is_out = best_score < OUT_OF_CONTEXT_THRESHOLD
 
     system_prompt = (
         "You are a compassionate, knowledgeable mental wellness assistant. Give well-structured, practical, "
@@ -401,49 +435,49 @@ def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Dep
         "If user is in crisis, advise contacting local emergency services."
     )
 
-    if is_out_of_context or not contexts:
-        prompt = (
-            f"SYSTEM:\n{system_prompt}\n\n"
-            f"USER:\n{body.message}\n\n"
-            f"ASSISTANT:\nProvide a clear, supportive, and practical response. If you cannot answer specifically, "
-            f"say that the question appears outside the uploaded documents and provide general helpful guidance."
-        )
+    if is_out or not contexts:
+        prompt = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{body.message}\n\nASSISTANT:\nProvide a clear, supportive answer."
     else:
-        ctx_blocks = []
-        for i, c in enumerate(contexts, start=1):
+        MAX_CTX = 2000
+        used = 0
+        blocks = []
+        for i, c in enumerate(contexts[:TOP_K], start=1):
             meta = c.get("meta", {})
             src = meta.get("filename") or meta.get("uploader") or c.get("id")
-            ctx_blocks.append(f"[source{i}] filename={src} score={c['score']:.4f}\n{c['text']}")
-        context_text = "\n\n".join(ctx_blocks)
+            text = (c["text"] or "")[:800]
+            block = f"[source{i}] filename={src} score={c['score']:.4f}\n{text}"
+            if used + len(block) > MAX_CTX:
+                break
+            blocks.append(block); used += len(block)
+        ctx = "\n\n".join(blocks)
         prompt = (
-            f"SYSTEM:\n{system_prompt}\n\n"
-            f"CONTEXT:\n{context_text}\n\n"
-            f"USER:\n{body.message}\n\n"
-            f"ASSISTANT:\nAnswer using the context above. If context fully answers, reference the sources like [source1]. "
-            f"Otherwise, provide a clear answer and mention when content is not found in documents."
+            f"SYSTEM:\n{system_prompt}\n\nCONTEXT:\n{ctx}\n\nUSER:\n{body.message}\n\nASSISTANT:\nUse the context above; cite like [source1]."
         )
 
-    reply = call_ollama(prompt, num_predict=body.num_predict or 512)
+    # route provider
+    provider = (body.provider or "mistral").lower()
+    if provider == "groq":
+        reply = call_groq(prompt, num_predict=body.num_predict or 192)
+    else:
+        reply = call_ollama(prompt, num_predict=body.num_predict or 192)
 
-    # Save messages
+    # save
     try:
-        db.add_all(
-            [
-                Message(conversation_id=conv_id, user_id=user.id, role="user", content=body.message),
-                Message(conversation_id=conv_id, user_id=user.id, role="assistant", content=reply),
-            ]
-        )
+        db.add_all([
+            Message(conversation_id=conv_id, user_id=user.id, role="user", content=body.message),
+            Message(conversation_id=conv_id, user_id=user.id, role="assistant", content=reply),
+        ])
+        conv = db.query(Conversation).filter(Conversation.id == conv_id, Conversation.user_id == user.id).first()
+        if conv and (not conv.title or conv.title in ("New Chat", "Welcome Chat")):
+            conv.title = _short_title_from_text(body.message)
         db.commit()
     except Exception as e:
-        print("[DB] failed to save messages:", e, traceback.format_exc())
+        print("[DB] save failed:", e, traceback.format_exc())
 
-    source_info = [{"id": c["id"], "score": c["score"], "meta": c.get("meta", {})} for c in contexts]
-    return {"reply": reply, "sources": source_info}
+    return {"reply": reply, "sources": [{"id": c["id"], "score": c["score"], "meta": c.get("meta", {})} for c in contexts]}
 
 
-# ---------------- Run server ----------------
 if __name__ == "__main__":
     import uvicorn
-
-    print("Starting app — ensure Qdrant and Ollama are running.")
+    print("Starting app — configure .env; Qdrant + Ollama optional; Groq needs GROQ_API_KEY. Using Groq SDK.")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
