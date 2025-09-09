@@ -1,15 +1,16 @@
-#working
 import os
 import uuid
+import json
 from datetime import datetime, timedelta
 from typing import List, Optional, Literal
 
 from dotenv import load_dotenv
-load_dotenv()  # load .env before reading env vars
+load_dotenv()
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -34,18 +35,15 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./psych_support.db")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.getenv("COLLECTION_NAME", "psych_docs")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 OUT_OF_CONTEXT_THRESHOLD = float(os.getenv("OUT_OF_CONTEXT_THRESHOLD", "0.22"))
 
 # Providers
-# Ollama (local Mistral)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral")
 
-# Groq (official Python SDK)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_DEFAULT = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
-# Single global client (safe to reuse)
 _groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
@@ -230,9 +228,31 @@ def search_qdrant(query: str, limit: int = TOP_K) -> List[dict]:
     return results
 
 
-# ---------------- LLMs ----------------
+# ---------------- helpers ----------------
+SOURCES_MARKER_PREFIX = "<!--SOURCES_JSON:"
+SOURCES_MARKER_SUFFIX = "-->"
 
-def call_ollama(prompt: str, num_predict: int = 192) -> str:
+def build_source_items(contexts: List[dict]) -> List[dict]:
+    """Return [{filename, excerpt}] from qdrant contexts."""
+    items = []
+    for c in contexts:
+        meta = c.get("meta") or {}
+        fname = meta.get("filename") or meta.get("uploader") or c.get("id")
+        text = (c.get("text") or "").strip().replace("\n", " ")
+        excerpt = text[:280] + ("…" if len(text) > 280 else "")
+        items.append({"filename": fname, "excerpt": excerpt})
+    return items
+
+def append_sources_marker(reply_text: str, contexts: List[dict]) -> str:
+    items = build_source_items(contexts)
+    if not items:
+        return reply_text
+    payload = json.dumps(items, ensure_ascii=False)
+    return f"{reply_text}\n\n{SOURCES_MARKER_PREFIX}{payload}{SOURCES_MARKER_SUFFIX}"
+
+
+# ---------------- LLMs ----------------
+def call_ollama(prompt: str, num_predict: int = 512) -> str:
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
@@ -242,7 +262,7 @@ def call_ollama(prompt: str, num_predict: int = 192) -> str:
                 "stream": False,
                 "options": {"num_predict": num_predict},
             },
-            timeout=300,
+            timeout=600,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -254,17 +274,9 @@ def call_ollama(prompt: str, num_predict: int = 192) -> str:
         return "Local model is not available right now."
 
 
-def call_groq(prompt: str, num_predict: int = 192) -> str:
-    """Call Groq using the official Python SDK."""
-    global _groq_client
-    if not GROQ_API_KEY:
+def call_groq(prompt: str, num_predict: int = 512) -> str:
+    if not _groq_client:
         return "Groq API key not configured. Add GROQ_API_KEY to .env."
-    if _groq_client is None:
-        try:
-            _groq_client = Groq(api_key=GROQ_API_KEY)
-        except Exception as e:
-            print("[LLM] Failed to init Groq client:", e)
-            return "Groq client initialization failed."
     try:
         chat_completion = _groq_client.chat.completions.create(
             model=GROQ_MODEL_DEFAULT,
@@ -304,11 +316,12 @@ class LoginIn(BaseModel):
 class ChatIn(BaseModel):
     message: str
     session_id: Optional[str] = None
-    num_predict: Optional[int] = 192
-    provider: Literal["mistral", "groq"] = "mistral"  # only provider name
+    num_predict: Optional[int] = 512
+    provider: Literal["mistral", "groq"] = "mistral"
 
 class ChatOut(BaseModel):
     reply: str
+    # still return structured sources if you want to inspect/debug in UI
     sources: List[dict] = Field(default_factory=list)
 
 class UpdateTitleIn(BaseModel):
@@ -328,6 +341,7 @@ def health():
         },
     }
 
+
 @app.post("/auth/register")
 def register(payload: RegisterIn, db: Session = Depends(get_db)):
     existing = db.query(User).filter(User.email == payload.email).first()
@@ -340,6 +354,7 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     token = create_access_token(user.email)
     return {"access_token": token, "token_type": "bearer"}
 
+
 @app.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email).first()
@@ -347,6 +362,7 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_access_token(user.email)
     return {"access_token": token, "token_type": "bearer"}
+
 
 @app.post("/register")
 def register_alias(payload: RegisterIn, db: Session = Depends(get_db)):
@@ -356,11 +372,13 @@ def register_alias(payload: RegisterIn, db: Session = Depends(get_db)):
 def login_alias(payload: LoginIn, db: Session = Depends(get_db)):
     return login(payload, db)
 
+
 @app.post("/sessions/create")
 def create_session(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
     db.add(conv); db.commit()
     return {"id": conv.id, "title": conv.title}
+
 
 @app.patch("/sessions/{session_id}")
 def update_session_title(session_id: str, payload: UpdateTitleIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -371,10 +389,12 @@ def update_session_title(session_id: str, payload: UpdateTitleIn, user: User = D
     db.commit()
     return {"id": conv.id, "title": conv.title}
 
+
 @app.get("/sessions")
 def list_sessions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).all()
     return [{"id": r.id, "title": r.title, "created_at": r.created_at.isoformat()} for r in rows]
+
 
 @app.get("/sessions/{session_id}/messages")
 def session_messages(session_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -385,6 +405,7 @@ def session_messages(session_id: str, user: User = Depends(get_current_user), db
         .all()
     )
     return [{"role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in msgs]
+
 
 @app.post("/ingest")
 def ingest(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -407,6 +428,7 @@ def _short_title_from_text(text: str) -> str:
     if len(words) > 8:
         s += "…"
     return s[:80]
+
 
 @app.post("/chat", response_model=ChatOut)
 def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -436,7 +458,12 @@ def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Dep
     )
 
     if is_out or not contexts:
-        prompt = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{body.message}\n\nASSISTANT:\nProvide a clear, supportive answer."
+        prompt = (
+            f"SYSTEM:\n{system_prompt}\n\n"
+            f"USER:\n{body.message}\n\n"
+            "ASSISTANT:\nProvide a clear, supportive answer. "
+            "Note: This answer is based on general knowledge and not from your uploaded documents."
+        )
     else:
         MAX_CTX = 2000
         used = 0
@@ -451,21 +478,25 @@ def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Dep
             blocks.append(block); used += len(block)
         ctx = "\n\n".join(blocks)
         prompt = (
-            f"SYSTEM:\n{system_prompt}\n\nCONTEXT:\n{ctx}\n\nUSER:\n{body.message}\n\nASSISTANT:\nUse the context above; cite like [source1]."
+            f"SYSTEM:\n{system_prompt}\n\n"
+            f"CONTEXT:\n{ctx}\n\n"
+            f"USER:\n{body.message}\n\n"
+            "ASSISTANT:\nUse the context above; cite like [source1]."
         )
 
     # route provider
     provider = (body.provider or "mistral").lower()
-    if provider == "groq":
-        reply = call_groq(prompt, num_predict=body.num_predict or 192)
-    else:
-        reply = call_ollama(prompt, num_predict=body.num_predict or 192)
+    max_toks = body.num_predict or 512
+    reply = call_groq(prompt, num_predict=max_toks) if provider == "groq" else call_ollama(prompt, num_predict=max_toks)
 
-    # save
+    # append invisible sources JSON marker (excerpts)
+    reply_with_marker = append_sources_marker(reply, contexts)
+
+    # save + auto-title
     try:
         db.add_all([
             Message(conversation_id=conv_id, user_id=user.id, role="user", content=body.message),
-            Message(conversation_id=conv_id, user_id=user.id, role="assistant", content=reply),
+            Message(conversation_id=conv_id, user_id=user.id, role="assistant", content=reply_with_marker),
         ])
         conv = db.query(Conversation).filter(Conversation.id == conv_id, Conversation.user_id == user.id).first()
         if conv and (not conv.title or conv.title in ("New Chat", "Welcome Chat")):
@@ -474,10 +505,142 @@ def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Dep
     except Exception as e:
         print("[DB] save failed:", e, traceback.format_exc())
 
-    return {"reply": reply, "sources": [{"id": c["id"], "score": c["score"], "meta": c.get("meta", {})} for c in contexts]}
+    # still return structured sources for convenience (UI may ignore)
+    return {"reply": reply_with_marker, "sources": build_source_items(contexts)}
+
+
+@app.post("/chat_stream")
+def chat_stream(body: ChatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Streams JSON lines:
+      {"type":"delta","text":"..."}  (many)
+      {"type":"done"}
+    The final delta contains the hidden <!--SOURCES_JSON:...--> marker appended.
+    """
+    def gen():
+        # ensure session
+        conv_id = body.session_id
+        if not conv_id:
+            conv = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).first()
+            if not conv:
+                conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title="New Chat")
+                db.add(conv); db.commit()
+            conv_id = conv.id
+
+        # RAG search
+        try:
+            contexts = search_qdrant(body.message, limit=TOP_K)
+        except Exception as e:
+            print("[RAG] search error:", e, traceback.format_exc())
+            contexts = []
+
+        best_score = max((c["score"] for c in contexts), default=0.0)
+        is_out = best_score < OUT_OF_CONTEXT_THRESHOLD
+
+        system_prompt = (
+            "You are a compassionate, knowledgeable mental wellness assistant. Give well-structured, practical, "
+            "non-clinical advice. If content refers to documented sources, cite them as [source1], [source2], etc. "
+            "If user is in crisis, advise contacting local emergency services."
+        )
+
+        if is_out or not contexts:
+            prompt = (
+                f"SYSTEM:\n{system_prompt}\n\n"
+                f"USER:\n{body.message}\n\n"
+                "ASSISTANT:\nProvide a clear, supportive answer. "
+                "Note: This answer is based on general knowledge and not from your uploaded documents."
+            )
+        else:
+            MAX_CTX = 2000
+            used = 0
+            blocks = []
+            for i, c in enumerate(contexts[:TOP_K], start=1):
+                meta = c.get("meta", {})
+                src = meta.get("filename") or meta.get("uploader") or c.get("id")
+                text = (c["text"] or "")[:800]
+                block = f"[source{i}] filename={src} score={c['score']:.4f}\n{text}"
+                if used + len(block) > MAX_CTX:
+                    break
+                blocks.append(block); used += len(block)
+            ctx = "\n\n".join(blocks)
+            prompt = (
+                f"SYSTEM:\n{system_prompt}\n\n"
+                f"CONTEXT:\n{ctx}\n\n"
+                f"USER:\n{body.message}\n\n"
+                "ASSISTANT:\nUse the context above; cite like [source1]."
+            )
+
+        provider = (body.provider or "mistral").lower()
+        max_toks = body.num_predict or 512
+
+        chunks: List[str] = []
+        try:
+            if provider == "groq":
+                if not _groq_client:
+                    yield json.dumps({"type":"delta","text":"[Groq key missing]\n"}) + "\n"
+                else:
+                    stream = _groq_client.chat.completions.create(
+                        model=GROQ_MODEL_DEFAULT,
+                        messages=[
+                            {"role": "system", "content": "You are a helpful, compassionate assistant."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=max_toks,
+                        temperature=0.2,
+                        stream=True,
+                    )
+                    for chunk in stream:
+                        d = ""
+                        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                            d = chunk.choices[0].delta.content
+                        if d:
+                            chunks.append(d)
+                            yield json.dumps({"type":"delta","text": d}) + "\n"
+            else:
+                with requests.post(
+                    f"{OLLAMA_URL}/api/generate",
+                    json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": True, "options": {"num_predict": max_toks}},
+                    stream=True,
+                    timeout=600,
+                ) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except Exception:
+                            continue
+                        d = ev.get("response")
+                        if d:
+                            chunks.append(d)
+                            yield json.dumps({"type":"delta","text": d}) + "\n"
+        except requests.exceptions.Timeout:
+            yield json.dumps({"type":"delta","text":"[Provider timed out]\n"}) + "\n"
+        finally:
+            final_text = "".join(chunks)
+            final_text_with_marker = append_sources_marker(final_text, contexts)
+
+            try:
+                db.add_all([
+                    Message(conversation_id=conv_id, user_id=user.id, role="user", content=body.message),
+                    Message(conversation_id=conv_id, user_id=user.id, role="assistant", content=final_text_with_marker),
+                ])
+                conv = db.query(Conversation).filter(Conversation.id == conv_id, Conversation.user_id == user.id).first()
+                if conv and (not conv.title or conv.title in ("New Chat", "Welcome Chat")):
+                    conv.title = _short_title_from_text(body.message)
+                db.commit()
+            except Exception as e:
+                print("[DB] save failed (stream):", e, traceback.format_exc())
+
+            # also show the marker at the end of the stream so UI can render sources immediately
+            yield json.dumps({"type":"delta","text": final_text_with_marker[len(final_text):]}) + "\n"
+            yield json.dumps({"type":"done"}) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/jsonl")
 
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting app — configure .env; Qdrant + Ollama optional; Groq needs GROQ_API_KEY. Using Groq SDK.")
+    print("Starting app — Groq SDK enabled; sources embedded as excerpts via hidden marker.")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

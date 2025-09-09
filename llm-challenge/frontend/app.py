@@ -1,5 +1,5 @@
 import os
-import time
+import json
 import requests
 import streamlit as st
 from datetime import datetime
@@ -20,9 +20,13 @@ if "sessions" not in st.session_state:
 if "edit_mode" not in st.session_state:
     st.session_state.edit_mode = False
 if "provider" not in st.session_state:
-    st.session_state.provider = "mistral"  # mistral (ollama) | groq
+    st.session_state.provider = "mistral"
+if "streaming" not in st.session_state:
+    st.session_state.streaming = True
 
 # ------------- helpers -------------
+SOURCES_MARKER_PREFIX = "<!--SOURCES_JSON:"
+SOURCES_MARKER_SUFFIX = "-->"
 
 def auth_headers():
     return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
@@ -34,11 +38,9 @@ def api_get(path: str, **kwargs):
         st.error(f"GET {path} failed: {e}")
         return None
 
-def api_post(path: str, json=None, files=None, params=None, timeout=300):
+def api_post(path: str, json=None, files=None, params=None, timeout=600):
     try:
-        return requests.post(
-            f"{API_BASE}{path}", headers=auth_headers(), json=json, files=files, params=params, timeout=timeout
-        )
+        return requests.post(f"{API_BASE}{path}", headers=auth_headers(), json=json, files=files, params=params, timeout=timeout)
     except Exception as e:
         st.error(f"POST {path} failed: {e}")
         return None
@@ -64,6 +66,28 @@ def human_time(ts_iso: str) -> str:
     except Exception:
         return ts_iso
 
+def split_reply_and_sources(text: str):
+    """
+    Returns (clean_text, items) where items = [{'filename','excerpt'}, ...]
+    If no sources marker found, items = [].
+    """
+    if not text:
+        return text, []
+    start = text.rfind(SOURCES_MARKER_PREFIX)
+    if start == -1:
+        return text, []
+    end = text.find(SOURCES_MARKER_SUFFIX, start)
+    if end == -1:
+        return text, []
+    try:
+        payload = text[start + len(SOURCES_MARKER_PREFIX): end]
+        items = json.loads(payload)
+        clean = text[:start].rstrip()
+        return clean, items if isinstance(items, list) else []
+    except Exception:
+        # if parsing fails, show text as-is
+        return text, []
+
 # ------------- SIDEBAR -------------
 with st.sidebar:
     st.header("Account")
@@ -88,28 +112,39 @@ with st.sidebar:
                 except Exception:
                     st.error("Authentication error")
     else:
-        colA, colB = st.columns([1,1])
-        with colA:
-            if st.button("🔄 Refresh Chats"):
-                refresh_sessions()
-        with colB:
-            if st.button("🚪 Logout"):
-                st.session_state.token = None
-                st.session_state.session_id = None
-                st.session_state.sessions = []
-                st.session_state.edit_mode = False
-                st.rerun()
+        st.subheader("Model Provider")
+        st.session_state.provider = st.selectbox(
+            "Choose provider",
+            options=["mistral", "groq"],
+            index=(0 if st.session_state.provider == "mistral" else 1),
+            help="Use **groq** for big questions. **mistral** (local) may be slow on long prompts.",
+        )
+        st.checkbox("Stream responses", value=st.session_state.streaming, key="streaming")
+
+        st.divider()
+        st.subheader("Upload Context (.txt)")
+        up = st.file_uploader("Select a .txt file", type=["txt"])
+        if up and st.button("Upload"):
+            r = api_post("/ingest", files={"file": up})
+            if r is not None and r.status_code == 200:
+                st.success(f"Ingested {r.json().get('ingested_chunks', 0)} chunks.")
+            else:
+                st.error(r.json().get("detail", "Upload failed") if r is not None else "Server error")
 
         st.divider()
         st.subheader("Your Chats")
-        if st.button("➕ New Chat"):
-            r = api_post("/sessions/create")
-            if r is not None and r.status_code == 200:
-                st.session_state.session_id = r.json()["id"]
-                refresh_sessions(); st.rerun()
-            else:
-                st.error(r.json().get("detail", "Failed to create chat") if r is not None else "Server error")
-
+        colA, colB = st.columns([1,1])
+        with colA:
+            if st.button("➕ New Chat"):
+                r = api_post("/sessions/create")
+                if r is not None and r.status_code == 200:
+                    st.session_state.session_id = r.json()["id"]
+                    refresh_sessions(); st.rerun()
+                else:
+                    st.error(r.json().get("detail", "Failed to create chat") if r is not None else "Server error")
+        with colB:
+            if st.button("🔄 Refresh"):
+                refresh_sessions()
         if not st.session_state.sessions:
             refresh_sessions()
         if st.session_state.sessions:
@@ -140,43 +175,19 @@ with st.sidebar:
                             if st.button("✖ Cancel"):
                                 st.session_state.edit_mode = False
                                 st.rerun()
-        else:
-            st.info("No chats yet.")
 
         st.divider()
-        st.subheader("Upload Context (.txt)")
-        up = st.file_uploader("Select a .txt file", type=["txt"])
-        if up and st.button("Upload"):
-            r = api_post("/ingest", files={"file": up})
-            if r is not None and r.status_code == 200:
-                st.success(f"Ingested {r.json().get('ingested_chunks', 0)} chunks.")
-            else:
-                st.error(r.json().get("detail", "Upload failed") if r is not None else "Server error")
-
-        st.divider()
-        st.subheader("Model Provider")
-        provider = st.selectbox(
-            "Choose provider",
-            options=["mistral", "groq"],
-            index=(0 if st.session_state.provider == "mistral" else 1),
-            help="Use **groq** for big questions. **mistral** (local) may be slow on long prompts.",
-        )
-        st.session_state.provider = provider
+        if st.button("🚪 Logout"):
+            st.session_state.token = None
+            st.session_state.session_id = None
+            st.session_state.sessions = []
+            st.session_state.edit_mode = False
+            st.rerun()
 
 # ------------- main panel -------------
 if not st.session_state.token:
     st.info("Login or register from the left panel to begin.")
     st.stop()
-
-h = api_get("/health")
-if h is not None and h.status_code == 200:
-    j = h.json()
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("API", "online" if j.get("ok") else "issue")
-    with c2: st.metric("Qdrant", "ready" if j.get("qdrant") else "not ready")
-    with c3: st.metric("Embedder", "ready" if j.get("embedder") else "not ready")
-
-st.divider()
 
 if not st.session_state.session_id:
     st.warning("Select a chat from the left or create a new one.")
@@ -185,19 +196,73 @@ if not st.session_state.session_id:
 msgs_resp = api_get(f"/sessions/{st.session_state.session_id}/messages")
 messages = msgs_resp.json() if (msgs_resp is not None and msgs_resp.status_code == 200) else []
 
+# Render history (assistant messages show dropdown with excerpts if available)
 for m in messages:
     role = m.get("role", "user")
-    content = m.get("content", "")
+    text = m.get("content", "")
     ts = datetime.fromisoformat(m.get("created_at", datetime.utcnow().isoformat())).strftime("%Y-%m-%d %H:%M")
-    with st.chat_message("user" if role == "user" else "assistant"):
-        st.markdown(content)
-        st.caption(ts)
+    if role == "user":
+        with st.chat_message("user"):
+            st.markdown(text)
+            st.caption(ts)
+    else:
+        clean_text, items = split_reply_and_sources(text)
+        with st.chat_message("assistant"):
+            st.markdown(clean_text)
+            if items:
+                with st.expander("📚 Sources"):
+                    for i, it in enumerate(items, start=1):
+                        fname = it.get("filename", "")
+                        excerpt = it.get("excerpt", "")
+                        st.markdown(f"**{i}. {fname}**")
+                        if excerpt:
+                            st.markdown(f"> {excerpt}")
+            st.caption(ts)
 
+# Chat input
 user_msg = st.chat_input("Type your message…")
 if user_msg:
     with st.chat_message("user"):
         st.markdown(user_msg)
-    with st.spinner("Thinking…"):
+
+    if st.session_state.get("streaming", True):
+        # STREAM path
+        msg_ph = st.chat_message("assistant")
+        with msg_ph:
+            text_area = st.empty()
+            acc = ""
+            try:
+                with requests.post(
+                    f"{API_BASE}/chat_stream",
+                    headers=auth_headers(),
+                    json={
+                        "message": user_msg,
+                        "session_id": st.session_state.session_id,
+                        "provider": st.session_state.get("provider", "mistral"),
+                    },
+                    stream=True,
+                    timeout=600,
+                ) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except Exception:
+                            continue
+                        if ev.get("type") == "delta":
+                            acc += ev.get("text", "")
+                            # live strip marker part from display
+                            clean, _items = split_reply_and_sources(acc)
+                            text_area.markdown(clean)
+                        elif ev.get("type") == "done":
+                            break
+            except Exception as e:
+                st.error(f"Streaming failed: {e}")
+        st.rerun()
+    else:
+        # NON STREAM path
         r = api_post(
             "/chat",
             json={
@@ -207,23 +272,9 @@ if user_msg:
             },
         )
         if r is not None and r.status_code == 200:
-            data = r.json()
-            reply = data.get("reply", "")
-            sources = data.get("sources", [])
-            with st.chat_message("assistant"):
-                st.markdown(reply)
-                if sources:
-                    with st.expander("Sources"):
-                        for i, s in enumerate(sources, start=1):
-                            meta = s.get("meta") or {}
-                            fname = meta.get("filename") or ""
-                            score = s.get("score")
-                            st.write(f"[{i}] {fname} — score: {score}")
-            time.sleep(0.1)
             st.rerun()
         else:
             try:
-                err = r.json().get("detail", "Error") if r is not None else "Server error"
+                st.error(r.json().get("detail", "Server error"))
             except Exception:
-                err = "Server error"
-            st.error(err)
+                st.error("Server error")

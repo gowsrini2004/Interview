@@ -7,7 +7,4 @@ PyJWT
 requests
 python-dotenv
 python-multipart
-<<<<<<< HEAD
 groq
-=======
->>>>>>> 6b05492ef3efac4731a0265e6f21cfa7135fbe18
