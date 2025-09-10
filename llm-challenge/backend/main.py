@@ -4,6 +4,19 @@ import json
 import re
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Literal, Dict, Any
+from sqlalchemy import or_, and_
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
+import ssl
+from email.utils import parseaddr, formataddr
+try:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler # type: ignore
+    from apscheduler.triggers.cron import CronTrigger# type: ignore
+except Exception:
+    AsyncIOScheduler = None
+    CronTrigger = None
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,18 +25,19 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body, Pat
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, AnyHttpUrl
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from passlib.context import CryptContext
+from passlib.context import CryptContext# type: ignore
 import jwt
 import requests
 import traceback
 
+
 # RAG libs
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
-from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient# type: ignore
+from qdrant_client.http import models as qmodels# type: ignore
+from sentence_transformers import SentenceTransformer# type: ignore
 
 # Groq SDK
 from groq import Groq
@@ -31,7 +45,7 @@ from groq import Groq
 # ---------------- CONFIG ----------------
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-change")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "240"))
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./psych_support.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 COLLECTION = os.getenv("COLLECTION_NAME", "psych_docs")
@@ -49,6 +63,22 @@ _groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else N
 
 CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
 
+# --- Email / SMTP ---
+SMTP_HOST = os.getenv("SMTP_HOST", "mailhog")   # use docker service name if using docker-compose
+SMTP_PORT = int(os.getenv("SMTP_PORT", "1025"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "Psych Support <no-reply@psychsupport.local>")
+
+# "none" | "starttls" | "ssl"
+SMTP_SECURE = os.getenv("SMTP_SECURE", "none").lower()
+SMTP_TIMEOUT = int(os.getenv("SMTP_TIMEOUT", "20"))
+# timezone for schedules
+LOCAL_TZ = ZoneInfo("Asia/Kolkata")
+
+# Enable/disable in-process scheduler (IMPORTANT when using multiple uvicorn workers)
+ENABLE_EMAIL_SCHEDULER = os.getenv("ENABLE_EMAIL_SCHEDULER", "1") == "1"
+
 # Questionnaire rules
 MIN_QUESTIONS = 7          # minimum to reach before offering score
 CONTINUE_STEP = 3            # increment each time user says "continue"
@@ -61,6 +91,21 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
+# --- models ---
+class Video(Base):
+    __tablename__ = "videos"
+    id = Column(String(36), primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    url = Column(String(512), nullable=False)
+    platform = Column(String(32), default="youtube")
+    description = Column(Text)
+    tags = Column(String(255))  # comma-separated
+    is_public = Column(Integer, default=1)  # keep existing if you already added it
+    # NEW:
+    added_by = Column(String(255), default="admin")    # 'admin' for now
+    access = Column(String(32), default="all")         # 'all' | 'users' | 'counsellor' | 'admin'
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 class User(Base):
     __tablename__ = "users"
@@ -182,6 +227,197 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+def _html_to_text(html: str) -> str:
+    # Very small fallback: strip tags
+    return re.sub(r"<[^>]+>", "", html or "").strip()
+
+def send_email(to_email: str, subject: str, html_body: str, text_body: Optional[str] = None) -> bool:
+    """Send email with optional TLS/SSL and auth. Returns True on success (raises on hard errors)."""
+    msg = MIMEMultipart("alternative")
+    # normalize "From" (extract address, keep display name)
+    from_name, from_addr = parseaddr(SMTP_FROM)
+    if not from_addr:
+        from_addr = "no-reply@psychsupport.local"
+    msg["From"] = formataddr((from_name or "Psych Support", from_addr))
+    msg["To"] = to_email
+    msg["Subject"] = subject
+
+    part_text = MIMEText(text_body or _html_to_text(html_body), "plain", "utf-8")
+    part_html = MIMEText(html_body, "html", "utf-8")
+    msg.attach(part_text)
+    msg.attach(part_html)
+
+    context = ssl.create_default_context()
+    try:
+        if SMTP_SECURE == "ssl":
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT, context=context)
+        else:
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT)
+
+        server.ehlo()
+        if SMTP_SECURE == "starttls":
+            server.starttls(context=context)
+            server.ehlo()
+
+        if SMTP_USER:
+            server.login(SMTP_USER, SMTP_PASSWORD or "")
+
+        server.sendmail(from_addr, [to_email], msg.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        # Surface clear info to logs; callers already catch per-recipient in your code.
+        print(f"[MAIL] send_email to={to_email} failed:", repr(e))
+        raise
+
+        
+def users_without_any_attempts(db: Session) -> list[User]:
+    # users having 0 rows in q_attempts
+    return (
+        db.query(User)
+        .outerjoin(QuestionnaireAttempt, QuestionnaireAttempt.user_id == User.id)
+        .group_by(User.id)
+        .having(func.count(QuestionnaireAttempt.id) == 0)
+        .all()
+    )
+
+def users_with_attempts_on_day(db: Session, day_str: str) -> list[User]:
+    sub = db.query(QuestionnaireAttempt.user_id).filter(QuestionnaireAttempt.day == day_str).distinct().subquery()
+    return db.query(User).filter(User.id.in_(sub)).all()
+
+def attempts_for_user_on_day(db: Session, user_id: int, day_str: str) -> list[QuestionnaireAttempt]:
+    return (
+        db.query(QuestionnaireAttempt)
+        .filter(QuestionnaireAttempt.user_id == user_id, QuestionnaireAttempt.day == day_str)
+        .order_by(QuestionnaireAttempt.created_at.asc())
+        .all()
+    )
+
+def attempts_for_user_all(db: Session, user_id: int) -> list[QuestionnaireAttempt]:
+    return (
+        db.query(QuestionnaireAttempt)
+        .filter(QuestionnaireAttempt.user_id == user_id)
+        .order_by(QuestionnaireAttempt.created_at.asc())
+        .all()
+    )
+
+def compose_reminder_html(username: str) -> tuple[str, str]:
+    subject = "Gentle reminder: Try today’s quick wellness check-in"
+    html = f"""
+    <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+      <h2>Hi {username},</h2>
+      <p>This is a quick nudge to try our <b>2–3 minute</b> mental wellness questionnaire.</p>
+      <ul>
+        <li>Track your mood & stress</li>
+        <li>Get personalized tips</li>
+      </ul>
+      <p>You can start it from your dashboard any time.</p>
+      <p style="color:#666">If you didn’t sign up for this, you can ignore this mail.</p>
+    </div>
+    """
+    return subject, html
+
+def compose_daily_summary_html(username: str, attempts: list[QuestionnaireAttempt]) -> tuple[str, str]:
+    scores = [a.score for a in attempts if a.score is not None]
+    avg = sum(scores) / len(scores) if scores else 0.0
+    latest_comment = attempts[-1].comment if attempts and attempts[-1].comment else ""
+    subject = "Your daily check-in summary"
+    html = f"""
+    <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+      <h2>Hi {username}, here’s your today’s summary</h2>
+      <p><b>Attempts today:</b> {len(attempts)}<br/>
+         <b>Average score:</b> {avg:.1f}/100</p>
+      {"<p><b>Latest note:</b> " + latest_comment + "</p>" if latest_comment else ""}
+      <p>Keep going—small, steady steps make a difference.</p>
+    </div>
+    """
+    return subject, html
+
+def compose_periodic_html(username: str, attempts: list[QuestionnaireAttempt]) -> tuple[str, str]:
+    if not attempts:
+        return ("Your check-in summary", f"<div style='font-family:system-ui,Segoe UI,Arial,sans-serif'><p>No attempts yet.</p></div>")
+
+    scores = [a.score for a in attempts if a.score is not None]
+    avg_all = sum(scores)/len(scores) if scores else 0.0
+    max_a = max(attempts, key=lambda a: (a.score or 0))
+    min_a = min(attempts, key=lambda a: (a.score or 0))
+
+    # Monthly groups
+    monthly: dict[str, list[QuestionnaireAttempt]] = {}
+    for a in attempts:
+        ym = (a.day or a.created_at.date().isoformat())[:7]  # YYYY-MM
+        monthly.setdefault(ym, []).append(a)
+
+    monthly_html = []
+    for ym, rows in sorted(monthly.items(), reverse=True):
+        s = [r.score for r in rows if r.score is not None]
+        avg_m = sum(s)/len(s) if s else 0.0
+        # list scores compactly
+        scores_str = ", ".join(f"{(r.score or 0):.0f}" for r in rows)
+        monthly_html.append(f"""
+          <div style="margin-bottom:10px">
+            <h4 style="margin:0">Month {ym}</h4>
+            <div>Attempts: {len(rows)} &middot; Avg: {avg_m:.1f}</div>
+            <div>Scores: {scores_str}</div>
+          </div>
+        """)
+    subject = "Your check-in progress summary"
+    html = f"""
+    <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+      <h2>Hi {username}, here’s your progress</h2>
+      <p><b>Total attempts:</b> {len(attempts)}<br/>
+         <b>Average score:</b> {avg_all:.1f}/100</p>
+      <p><b>Highest:</b> {max_a.score:.1f} — {max_a.comment or "—"}</p>
+      <p><b>Lowest:</b> {min_a.score:.1f} — {min_a.comment or "—"}</p>
+      <hr/>
+      <h3 style="margin-top:10px">By month</h3>
+      {''.join(monthly_html)}
+    </div>
+    """
+    return subject, html
+
+def send_reminders_to_incomplete_users(db: Session) -> int:
+    users = users_without_any_attempts(db)
+    sent = 0
+    for u in users:
+        try:
+            subject, html = compose_reminder_html(username_from_email(u.email))
+            send_email(u.email, subject, html)
+            sent += 1
+        except Exception as e:
+            print("[MAIL] reminder failed for", u.email, e)
+    return sent
+
+def send_daily_summaries_today(db: Session) -> int:
+    today = date.today().isoformat()
+    users = users_with_attempts_on_day(db, today)
+    sent = 0
+    for u in users:
+        rows = attempts_for_user_on_day(db, u.id, today)
+        if not rows:
+            continue
+        try:
+            subject, html = compose_daily_summary_html(username_from_email(u.email), rows)
+            send_email(u.email, subject, html)
+            sent += 1
+        except Exception as e:
+            print("[MAIL] daily summary failed for", u.email, e)
+    return sent
+
+def send_periodic_summaries_all(db: Session) -> int:
+    users = db.query(User).all()
+    sent = 0
+    for u in users:
+        rows = attempts_for_user_all(db, u.id)
+        if not rows:
+            continue
+        try:
+            subject, html = compose_periodic_html(username_from_email(u.email), rows)
+            send_email(u.email, subject, html)
+            sent += 1
+        except Exception as e:
+            print("[MAIL] periodic summary failed for", u.email, e)
+    return sent
 
 def require_admin(user=Depends(get_current_user)):
     if is_admin_principal(user):
@@ -320,6 +556,34 @@ def build_source_items(contexts: List[dict]) -> List[dict]:
     return items
 
 # -------------- NEW helpers for numbered citations & OOC prefix --------------
+
+_YT_PATTERNS = [
+    r"(?:https?://)?(?:www\.)?youtube\.com/watch\?v=([A-Za-z0-9_\-]{6,})",
+    r"(?:https?://)?youtu\.be/([A-Za-z0-9_\-]{6,})",
+    r"(?:https?://)?(?:www\.)?youtube\.com/embed/([A-Za-z0-9_\-]{6,})",
+]
+
+def normalize_youtube_url(url: str) -> str:
+    url = (url or "").strip()
+    for pat in _YT_PATTERNS:
+        m = re.match(pat, url)
+        if m:
+            vid = m.group(1)
+            return f"https://www.youtube.com/watch?v={vid}"
+    # fallback: keep as-is if it's http(s) and looks like youtube domain
+    if "youtube.com" in url or "youtu.be" in url:
+        return url
+    raise HTTPException(status_code=400, detail="Only YouTube links are supported for now.")
+
+def _tags_to_str(tags: Optional[List[str]]) -> str:
+    if not tags: return ""
+    return ",".join(t.strip() for t in tags if t and t.strip())
+
+def _str_to_tags(s: Optional[str]) -> List[str]:
+    if not s: return []
+    return [t.strip() for t in s.split(",") if t.strip()]
+
+
 OOC_PREFIX = "🌐 I couldn’t find context in your uploaded sources — this answer is drawn from general knowledge!!"
 
 
@@ -502,6 +766,28 @@ app.add_middleware(
 
 
 # ---------------- Schemas ----------------
+class VideoCreate(BaseModel):
+    title: str = Field(..., max_length=255)
+    url: AnyHttpUrl  # or str if you prefer
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    is_public: bool = True
+
+class VideoOut(BaseModel):
+    id: str
+    title: str
+    url: str
+    platform: str
+    description: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    is_public: bool
+    # NEW:
+    added_by: Optional[str] = None
+    access: str
+    created_at: datetime
+
+
+
 class RegisterIn(BaseModel):
     email: EmailStr
     password: str
@@ -541,7 +827,7 @@ class QAnswerOut(BaseModel):
     tips: List[str] = Field(default_factory=list)
 
 
-# ---------------- helpers: titles, username ----------------
+
 def delete_user_vectors(user_id: int) -> None:
     qc = init_qdrant()
     if not qc:
@@ -814,6 +1100,142 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
     return StreamingResponse(gen(), media_type="application/jsonl")
 
 # ---------------- Chat Delete By USer----------------
+@app.get("/videos", response_model=List[VideoOut])
+def list_videos(q: Optional[str] = None, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    qry = db.query(Video)
+
+    if not is_admin_principal(user):
+        qry = qry.filter(Video.access.in_(["all", "users"]), Video.is_public == 1)
+
+    if q:
+        like = f"%{q.strip()}%"
+        qry = qry.filter(or_(Video.title.ilike(like),
+                             Video.description.ilike(like),
+                             Video.tags.ilike(like)))
+
+    rows = qry.order_by(desc(Video.created_at)).all()
+    return [{
+        "id": v.id,
+        "title": v.title,
+        "url": v.url,
+        "platform": v.platform,
+        "description": v.description,
+        "tags": _str_to_tags(v.tags),
+        "is_public": bool(v.is_public),
+        "added_by": v.added_by,
+        "access": v.access,
+        "created_at": v.created_at,
+    } for v in rows]
+
+
+@app.post("/admin/emails/reminders")
+def admin_send_reminders(db: Session = Depends(get_db), admin=Depends(require_admin)):
+    count = send_reminders_to_incomplete_users(db)
+    return {"ok": True, "sent": count}
+
+@app.post("/admin/emails/daily-summaries")
+def admin_send_daily_summaries(db: Session = Depends(get_db), admin=Depends(require_admin)):
+    count = send_daily_summaries_today(db)
+    return {"ok": True, "sent": count}
+
+@app.post("/admin/emails/periodic-summaries")
+def admin_send_periodic_summaries(db: Session = Depends(get_db), admin=Depends(require_admin)):
+    count = send_periodic_summaries_all(db)
+    return {"ok": True, "sent": count}
+
+@app.post("/admin/videos", response_model=VideoOut)
+def admin_add_video(body: VideoCreate, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    url = normalize_youtube_url(str(body.url))
+    v = Video(
+        id=str(uuid.uuid4()),
+        title=body.title.strip(),
+        url=url,
+        platform="youtube",
+        description=(body.description or "").strip() or None,
+        tags=_tags_to_str(body.tags),
+        is_public=1 if body.is_public else 0,
+        # NEW defaults:
+        added_by="admin",
+        access="all",
+    )
+    db.add(v); db.commit(); db.refresh(v)
+    return {
+        "id": v.id,
+        "title": v.title,
+        "url": v.url,
+        "platform": v.platform,
+        "description": v.description,
+        "tags": _str_to_tags(v.tags),
+        "is_public": bool(v.is_public),
+        "added_by": v.added_by,
+        "access": v.access,
+        "created_at": v.created_at,
+    }
+
+@app.on_event("startup")
+async def start_email_scheduler():
+    if not ENABLE_EMAIL_SCHEDULER or AsyncIOScheduler is None or CronTrigger is None:
+        print("[SCHED] Scheduler disabled or APScheduler not installed.")
+        return
+    try:
+        scheduler = AsyncIOScheduler(timezone=LOCAL_TZ)
+
+        def _job_wrapper():
+            # Run reminders at trigger time
+            db = SessionLocal()
+            try:
+                n = send_reminders_to_incomplete_users(db)
+                print(f"[SCHED] Reminders sent: {n}")
+            finally:
+                db.close()
+
+        # 2PM and 8PM IST every day
+        scheduler.add_job(_job_wrapper, CronTrigger(hour=14, minute=0, timezone=LOCAL_TZ))
+        scheduler.add_job(_job_wrapper, CronTrigger(hour=20, minute=0, timezone=LOCAL_TZ))
+
+        scheduler.start()
+        print("[SCHED] Email scheduler started (IST 14:00 & 20:00).")
+    except Exception as e:
+        print("[SCHED] Failed to start:", e)
+
+class VideoUpdate(BaseModel):
+    title: Optional[str] = None
+    url: Optional[AnyHttpUrl] = None
+    description: Optional[str] = None
+    tags: Optional[List[str]] = None
+    is_public: Optional[bool] = None
+
+@app.patch("/admin/videos/{video_id}", response_model=VideoOut)
+def admin_update_video(video_id: str, body: VideoUpdate, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    v = db.query(Video).filter(Video.id == video_id).first()
+    if not v: raise HTTPException(status_code=404, detail="Video not found")
+
+    if body.title is not None: v.title = body.title.strip()
+    if body.url is not None: v.url = normalize_youtube_url(str(body.url))
+    if body.description is not None: v.description = (body.description or "").strip() or None
+    if body.tags is not None: v.tags = _tags_to_str(body.tags)
+    if body.is_public is not None: v.is_public = 1 if body.is_public else 0
+
+    db.commit(); db.refresh(v)
+    return {
+        "id": v.id,
+        "title": v.title,
+        "url": v.url,
+        "platform": v.platform,
+        "description": v.description,
+        "tags": _str_to_tags(v.tags),
+        "is_public": bool(v.is_public),
+        "added_by": v.added_by,
+        "created_at": v.created_at,
+    }
+
+@app.delete("/admin/videos/{video_id}")
+def admin_delete_video(video_id: str, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    v = db.query(Video).filter(Video.id == video_id).first()
+    if not v: raise HTTPException(status_code=404, detail="Video not found")
+    db.delete(v); db.commit()
+    return {"ok": True}
+
 
 @app.delete("/admin/users/{user_id}/vectors")
 def admin_clear_user_vectors(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
@@ -1129,6 +1551,19 @@ def admin_delete_user(user_id: int, db: Session = Depends(get_db), admin=Depends
     db.query(User).filter(User.id == user_id).delete()
     db.commit()
     return {"ok": True}
+
+@app.post("/admin/emails/test") #test
+def admin_test_email(to: EmailStr = Body(..., embed=True), admin=Depends(require_admin)):
+    try:
+        ok = send_email(
+            to_email=str(to),
+            subject="Psych Support: SMTP Test",
+            html_body="<div style='font-family:system-ui'>✅ SMTP test from Psych Support.</div>",
+            text_body="SMTP test from Psych Support (plain)."
+        )
+        return {"ok": ok}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SMTP error: {e!r}")
 
 
 @app.delete("/admin/users/{user_id}/chats")

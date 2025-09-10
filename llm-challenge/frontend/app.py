@@ -11,6 +11,24 @@ import streamlit as st
 from datetime import datetime
 import pandas as pd
 from collections import defaultdict
+from datetime import datetime
+from zoneinfo import ZoneInfo
+# ---------- sensible defaults ----------
+def ensure_session_defaults():
+    st.session_state.setdefault("username", "")
+    st.session_state.setdefault("is_admin", False)
+    st.session_state.setdefault("provider", "groq")
+    st.session_state.setdefault("streaming", True)
+    st.session_state.setdefault("view", "chat")         # "chat" | "dashboard" | "videos" | "email"
+    st.session_state.setdefault("sessions", [])
+    st.session_state.setdefault("messages_cache", {})
+
+def is_admin() -> bool:
+    return bool(st.session_state.get("is_admin", False))
+
+
+
+LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 
 API_BASE = os.getenv("API_BASE", "http://localhost:8000")
 APP_TITLE = "Psych Support — RAG Chat"
@@ -288,56 +306,102 @@ if not st.session_state.token:
 # ======= render modal panel (if open) =======
 render_modal_panel()
 
-# =========================
-# Dual Sidebar (ACCOUNT + YOUR CHATS)
-# =========================
-with st.sidebar:
-    # ======= top-right logout (outside sidebar) =======
-    if st.button("Logout"):
+def render_sidebar():
+    ensure_session_defaults()
+
+    with st.sidebar:
+        # Logout (in sidebar). If you prefer top-right, use the optional block above instead and remove this:
+        if st.button("Logout", key="logout_sidebar"):
             st.session_state.clear()
             st.rerun()
-    greet_name = st.session_state.username or "there"
 
-    # ACCOUNT
-    st.markdown(f"### Hi {greet_name} 🙂")
-    with st.expander("## ⚙️ Utils", expanded=True):
-        if st.session_state.is_admin:
-            st.caption("Role: **Admin**")
-            st.markdown("**Vector Store (Qdrant)**")
-            st.caption("Delete the entire vector collection and document records.")
-            if st.button("Clear Vector DB"):
-                open_modal("vector_clear"); st.rerun()
+        greet_name = st.session_state.get("username") or "there"
+        st.markdown(f"### Hi {greet_name} 🙂")
+
+        # ------------------ ADMIN VIEW ------------------
+        if is_admin():
+            st.subheader("Admin Console")
+
+            # Utility (Admin)
+            with st.expander("⚙️ Utility", expanded=False):
+                st.caption("Role: **Admin**")
+                st.markdown("**Vector Store (Qdrant)**")
+                st.caption("Delete the entire vector collection and document records.")
+                if st.button("🧹 Clear Vector DB", key="btn_clear_vector_db"):
+                    open_modal("vector_clear")
+                    st.rerun()
+
+            # Email tool (Admin only)
+            with st.expander("📧 Email Tool", expanded=False):
+                st.caption("Visible only to Admins")
+                if st.button("Remind - incomplete users"):
+                        r = api_post("/admin/emails/reminders")
+                        if r is not None and r.status_code == 200:
+                            st.success(f"Sent: {r.json().get('sent', 0)}")
+                        else:
+                            st.error("Failed to send reminders")
+
+                if st.button("Send Daily Scores (today)"):
+                        r = api_post("/admin/emails/daily-summaries")
+                        if r is not None and r.status_code == 200:
+                            st.success(f"Sent: {r.json().get('sent', 0)}")
+                        else:
+                            st.error("Failed to send daily summaries")
+
+                if st.button("Send Summary (overall + monthly)"):
+                        r = api_post("/admin/emails/periodic-summaries")
+                        if r is not None and r.status_code == 200:
+                            st.success(f"Sent: {r.json().get('sent', 0)}")
+                        else:
+                            st.error("Failed to send periodic summaries")
+                            
+            # Videos (optional for Admin too)
+            with st.expander("🎬 Videos", expanded=False):
+                if st.button("🎬 Open Library", key="btn_videos_admin", use_container_width=True):
+                    st.session_state.view = "videos"
+                    st.rerun()
+
+            # NOTE: Questionnaire & Your Chats are intentionally hidden for Admin.
+
+        # ------------------ USER VIEW ------------------
         else:
+            # Utility (User)
+            with st.expander("⚙️ Utility", expanded=False):
+                st.caption("Role: **User**")
+
                 st.markdown("**Model Provider**")
                 st.session_state.provider = st.selectbox(
                     "Choose provider",
-                    ["groq","mistral"],
-                    index=0 if st.session_state.provider == "groq" else 1,
+                    ["groq", "mistral"],
+                    index=0 if st.session_state.get("provider") == "groq" else 1,
+                    key="select_provider",
                 )
-                st.checkbox("Stream responses", value=st.session_state.streaming, key="streaming")
+
+                st.checkbox(
+                    "Stream responses",
+                    value=st.session_state.get("streaming", True),
+                    key="streaming"
+                )
 
                 st.markdown("**Upload Context (.txt)**")
-                up = st.file_uploader("Select a .txt file", type=["txt"])
-                if up and st.button("Upload"):
+                up = st.file_uploader("Select a .txt file", type=["txt"], key="txt_uploader")
+                if up and st.button("Upload", key="btn_upload_txt"):
                     r = api_post("/ingest", files={"file": up})
                     if r is not None and r.status_code == 200:
                         st.success(f"Ingested {r.json().get('ingested_chunks', 0)} chunks.")
                     else:
                         try:
-                            st.error(r.json().get("detail","Upload failed"))
+                            st.error(r.json().get("detail", "Upload failed"))
                         except Exception:
                             st.error("Server error during upload")
-                            
-    # QUESTIONERS
-    with st.expander("## 📊 Questionnaire", expanded=True):
-            if st.session_state.is_admin:
-                st.info("No chats for admin account.")
-            else:
+
+            # Questionnaire (User only)
+            with st.expander("📊 Questionnaire", expanded=False):
                 st.caption("Answer at least 10 adaptive questions. Then continue (+3) or get your score.")
-                if st.button("📊 Your Dashboard"):
+                if st.button("📊 Your Dashboard", key="btn_user_dashboard", use_container_width=True):
                         st.session_state.view = "dashboard"
-                        st.rerun()     
-                if st.button("▶ Start Questionnaire"):
+                        st.rerun()
+                if st.button("▶ Start Questionnaire", key="btn_start_questionnaire", use_container_width=True):
                         r = api_post("/questionnaire/start")
                         if r is not None and r.status_code == 200:
                             data = r.json()
@@ -345,51 +409,115 @@ with st.sidebar:
                             st.session_state.session_id = data["session_id"]
                             st.session_state.view = "chat"
                             st.rerun()
-                if st.session_state.q_session_id:
-                    st.success("Questionnaire in progress.")
-        
-        
-    # YOUR CHATS
-    with st.expander("## 🤖 Your Chats", expanded=True):
-        if st.session_state.is_admin:
-            st.info("No chats for admin account.")
-        else:
-                if not st.session_state.sessions:
-                    refresh_sessions()
-                
-                colA, colB = st.columns([1,1])
+                        else:
+                            st.error("Could not start questionnaire")
+
+            # Videos (User)
+            with st.expander("🎬 Videos", expanded=False):
+                if st.button("🎬 Open Library", key="btn_videos_user", use_container_width=True):
+                    st.session_state.view = "videos"
+                    st.rerun()
+
+            # Your Chats (User only)
+            with st.expander("🤖 Your Chats", expanded=False):
+                # Quick actions
+                colA, colB = st.columns([1, 1])
                 with colA:
-                    if st.button("➕ New Chat"):
+                    if st.button("➕ New Chat", key="btn_new_chat", use_container_width=True):
                         st.session_state.session_id = None
                         st.session_state.view = "chat"
                         st.rerun()
                 with colB:
-                    if st.button("🔄 Refresh"):
+                    if st.button("🔄 Refresh", key="btn_refresh_chats", use_container_width=True):
+                        # clear cache on refresh
+                        st.session_state.pop("messages_cache", None)
                         refresh_sessions()
 
-                groups = defaultdict(list)
-                for row in st.session_state.sessions:
-                    d = human_time(row["created_at"])[:10]  # 'YYYY-MM-DD'
-                    groups[d].append(row)
+                # Ensure sessions are loaded
+                if not st.session_state.get("sessions"):
+                    refresh_sessions()
 
-                date_keys = sorted(groups.keys(), reverse=True)
-                for day in date_keys:
-                    dt = datetime.strptime(day, "%Y-%m-%d")
-                    label = dt.strftime("%b %d %y")
-                    st.markdown(f"**{label}**")
-                    for row in groups[day]:
-                        btn_label = f"🗨️ {row['title'] or 'Chat'}"
-                        if st.button(btn_label, key=f"chat_{row['id']}"):
-                            st.session_state.view = "chat"
-                            st.session_state.session_id = row["id"]
-                            st.rerun()
-                    st.markdown("---")
+                # Search
+                search_q = st.text_input(
+                    "Search chats",
+                    key="chat_search",
+                    placeholder="Search by title or message…",
+                )
 
-# -------- ADMIN view --------
+                row1 = st.container()
+                col1, col2 = row1.columns([4, 1])
+                with col1:
+                    search_in_messages = st.checkbox(
+                        "Search inside messages",
+                        key="chat_search_messages",
+                        value=False
+                    )
+
+                def _clear_chat_search():
+                    st.session_state.update({
+                        "chat_search": "",
+                        "chat_search_messages": False,
+                    })
+                    st.session_state.pop("messages_cache", None)
+
+                with col2:
+                    st.button("❌", key="chat_clear_btn", on_click=_clear_chat_search)
+
+                # --- Filter logic ---
+                sess_list = list(st.session_state.get("sessions", []))  # copy
+                q = (search_q or "").strip().lower()
+
+                # simple cache for session messages to avoid re-fetching repeatedly
+                if "messages_cache" not in st.session_state:
+                    st.session_state.messages_cache = {}
+
+                if q:
+                    if search_in_messages:
+                        matches = []
+                        for s in sess_list:
+                            title = (s.get("title") or "").lower()
+                            if q in title:
+                                matches.append(s)
+                                continue
+                            sid = s["id"]
+                            cache = st.session_state.messages_cache.get(sid)
+                            if cache is None:
+                                rmsgs = api_get(f"/sessions/{sid}/messages")
+                                cache = rmsgs.json() if (rmsgs is not None and rmsgs.status_code == 200) else []
+                                st.session_state.messages_cache[sid] = cache
+                            if any(q in (m.get("content", "").lower()) for m in cache):
+                                matches.append(s)
+                        sess_list = matches
+                    else:
+                        # title-only search
+                        sess_list = [s for s in sess_list if q in ((s.get("title") or "").lower())]
+
+                # --- Render results ---
+                if not sess_list:
+                    st.info("No chats matched your search.")
+                else:
+                    groups = defaultdict(list)
+                    for row in sess_list:
+                        d = human_time(row["created_at"])[:10]  # 'YYYY-MM-DD'
+                        groups[d].append(row)
+
+                    for day in sorted(groups.keys(), reverse=True):
+                        dt = datetime.strptime(day, "%Y-%m-%d")
+                        label = dt.strftime("%b %d %y")
+                        st.markdown(f"**{label}**")
+                        for row in groups[day]:
+                            btn_label = f"🗨️ {row['title'] or 'Chat'}"
+                            if st.button(btn_label, key=f"chat_{row['id']}"):
+                                st.session_state.view = "chat"
+                                st.session_state.session_id = row["id"]
+                                st.rerun()
+                        st.markdown("---")
+
+render_sidebar()
+
 if st.session_state.view == "admin":
-    st.subheader("🛠 Admin Panel")
+    st.header("🛠 Admin Panel")
 
-    # Users list
     ru = api_get("/admin/users")
     users = ru.json() if (ru is not None and ru.status_code == 200) else []
     if not users:
@@ -428,6 +556,7 @@ if st.session_state.view == "admin":
                 st.session_state.actions_user = {"id": u["id"], "email": u["email"]}
                 open_modal("user_actions", {"user_id": u["id"], "email": u["email"]}); st.rerun()
 
+    
     st.stop()
 
 # -------- dashboard view --------
@@ -442,6 +571,81 @@ if st.session_state.view == "dashboard":
         df = pd.DataFrame(data)
         st.dataframe(df, use_container_width=True, hide_index=True)
     st.stop()
+    
+# -------- videos view --------
+if st.session_state.view == "videos":
+    st.subheader("🎬 Video Library")
+
+    # Admin add form (visible only to admin)
+    if st.session_state.is_admin:
+        with st.expander("➕ Add a YouTube Video (Admin)", expanded=False):
+            with st.form("add_video_form", clear_on_submit=True):
+                v_title = st.text_input("Title")
+                v_url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
+                v_desc = st.text_area("Description (optional)", height=80)
+                v_tags = st.text_input("Tags (comma-separated, optional)", placeholder="stress, breathing, sleep")
+                v_public = st.checkbox("Public", value=True)
+                submitted = st.form_submit_button("Add Video")
+            if submitted:
+                payload = {
+                    "title": v_title,
+                    "url": v_url,
+                    "description": v_desc or None,
+                    "tags": [t.strip() for t in (v_tags or "").split(",") if t.strip()],
+                    "is_public": v_public,
+                }
+                r = api_post("/admin/videos", json=payload)
+                if r is not None and r.status_code == 200:
+                    st.success("Video added.")
+                else:
+                    try: st.error(r.json().get("detail", "Failed to add video"))
+                    except Exception: st.error("Server error while adding video")
+
+    # Search
+    q = st.text_input("Search videos (title / description / tags)", key="video_search", placeholder="e.g., anxiety, breathing")
+    params = {"q": q} if q else None
+    with st.spinner("Loading videos…"):
+        rv = api_get("/videos", params=params)
+    videos = rv.json() if (rv is not None and rv.status_code == 200) else []
+
+    if not videos:
+        st.info("No videos found.")
+        st.stop()
+
+    # Render in a responsive 2-column grid
+    def render_tags(tags: list[str]):
+        if not tags: return
+        st.markdown(" ".join([f"<span style='padding:2px 8px;border:1px solid #444;border-radius:12px;font-size:12px;margin-right:4px;display:inline-block'>{t}</span>" 
+                              for t in tags]), unsafe_allow_html=True)
+
+    cols_per_row = 2
+    for i in range(0, len(videos), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            idx = i + j
+            if idx >= len(videos): break
+            v = videos[idx]
+            with col:
+                st.video(v["url"])
+                st.markdown(f"**{v['title']}**")
+                if v.get("description"):
+                    st.caption(v["description"])
+                render_tags(v.get("tags", []))
+                st.caption(f"Added by: {v.get('added_by','admin')}  •  Platform: {v.get('platform','youtube').title()}  •  Visibility: {'Public' if v.get('is_public') else 'Hidden'}")
+                # admin controls
+                if st.session_state.is_admin:
+                    c1, c2 = st.columns([1,1])
+                    with c1:
+                        if st.button("Delete", key=f"del_{v['id']}"):
+                            rr = api_delete(f"/admin/videos/{v['id']}")
+                            if rr is not None and rr.status_code in (200, 204):
+                                st.success("Deleted.")
+                                st.rerun()
+                            else:
+                                try: st.error(rr.json().get("detail","Delete failed"))
+                                except Exception: st.error("Server error")
+    st.stop()
+
 
 # -------- chat / conversation page --------
 st.subheader("💬 New Chat" if not st.session_state.session_id else "💬 Conversation")
@@ -477,7 +681,10 @@ if st.session_state.session_id and not st.session_state.is_admin:
     for m in messages:
         role = m.get("role", "user")
         text = m.get("content", "")
-        ts = datetime.fromisoformat(m.get("created_at", datetime.utcnow().isoformat())).strftime("%Y-%m-%d %H:%M")
+        dt = datetime.fromisoformat(m.get("created_at", datetime.utcnow().isoformat()))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))   # backend saves UTC
+        ts = dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
         if role == "user":
             with st.chat_message("user"):
                 st.markdown(text); st.caption(ts)
@@ -532,6 +739,7 @@ if (not st.session_state.is_admin) and st.session_state.q_session_id and st.sess
                         st.markdown("**Tips**")
                         for t in tips: st.markdown(f"- {t}")
                 st.session_state.q_session_id = None
+                st.session_state.session_id = None   # optional: also close that chat
                 st.rerun()
             else:
                 with st.chat_message("assistant"):
