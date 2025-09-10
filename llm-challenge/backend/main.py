@@ -193,7 +193,6 @@ def require_admin(user=Depends(get_current_user)):
 _qdrant: Optional[QdrantClient] = None
 _embedder: Optional[SentenceTransformer] = None
 
-
 def init_embedder() -> Optional[SentenceTransformer]:
     global _embedder
     if _embedder is not None:
@@ -225,6 +224,17 @@ def init_qdrant() -> Optional[QdrantClient]:
                 collection_name=COLLECTION,
                 vectors_config=qmodels.VectorParams(size=vec_size, distance=qmodels.Distance.COSINE),
             )
+        # ✅ Optional but recommended: index user_id for fast filtering
+        try:
+            _qdrant.create_payload_index(
+                collection_name=COLLECTION,
+                field_name="user_id",
+                field_schema=qmodels.PayloadSchemaType.INTEGER,
+            )
+        except Exception:
+            # index may already exist; ignore
+            pass
+
         print("[RAG] Qdrant connected:", QDRANT_URL)
         return _qdrant
     except Exception as e:
@@ -252,19 +262,37 @@ def upsert_documents_to_qdrant(payloads: List[dict]) -> int:
             qmodels.PointStruct(
                 id=p["id"],
                 vector=vectors[i],
-                payload={"text": p["text"], "meta": p.get("meta", {})},
+                payload={
+                    "text": p["text"],
+                    "meta": p.get("meta", {}),
+                    "user_id": p.get("user_id")  # ✅ add user_id here
+                },
             )
         )
     qc.upsert(collection_name=COLLECTION, points=points)
     return len(points)
 
 
-def search_qdrant(query: str, limit: int = TOP_K) -> List[dict]:
+def search_qdrant(query: str, limit: int = TOP_K, user_id: Optional[int] = None) -> List[dict]:
     qc = init_qdrant()
     if qc is None:
         return []
     qvec = embed_texts([query])[0]
-    hits = qc.search(collection_name=COLLECTION, query_vector=qvec, limit=limit)
+
+    q_filter = None
+    if user_id is not None:
+        q_filter = qmodels.Filter(
+            must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id))]
+        )
+
+    # Depending on qdrant-client version, the kwarg is either `query_filter` or `filter`.
+    # Most recent clients use `query_filter=`.
+    hits = qc.search(
+        collection_name=COLLECTION,
+        query_vector=qvec,
+        limit=limit,
+        query_filter=q_filter,  # <-- if this errors, change to `filter=q_filter`
+    )
     results = []
     for h in hits:
         results.append({
@@ -339,8 +367,8 @@ def call_groq(prompt: str, num_predict: int = 512) -> str:
 app = FastAPI(title="Psych Support - RAG Chat")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=CORS_ALLOWED_ORIGINS,   # ["*"]
+    allow_credentials=False,              # <- change this if using "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -387,6 +415,26 @@ class QAnswerOut(BaseModel):
 
 
 # ---------------- helpers: titles, username ----------------
+def delete_user_vectors(user_id: int) -> None:
+    qc = init_qdrant()
+    if not qc:
+        return
+    try:
+        qc.delete(
+            collection_name=COLLECTION,
+            points_selector=qmodels.FilterSelector(
+                filter=qmodels.Filter(
+                    must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id))]
+                )
+            ),
+            wait=True,
+        )
+        print(f"[Qdrant] Deleted vectors for user_id={user_id}")
+    except Exception as e:
+        print("[Qdrant] delete_user_vectors failed:", e)
+
+
+
 def short_title(text: str) -> str:
     t = (text or "").strip().replace("\n", " ")
     if not t: return "New Chat"
@@ -492,7 +540,12 @@ def ingest(file: UploadFile = File(...), user=Depends(get_current_user), db: Ses
         raise HTTPException(status_code=400, detail="Only .txt supported.")
     raw = file.file.read().decode("utf-8", errors="ignore")
     chunks = [raw[i:i+800].strip() for i in range(0, len(raw), 800) if raw[i:i+800].strip()]
-    payloads = [{"id": str(uuid.uuid4()), "text": c, "meta": {"uploader": user.email, "filename": file.filename}} for c in chunks]
+    payloads = [{
+        "id": str(uuid.uuid4()),
+        "text": c,
+        "meta": {"uploader": user.email, "filename": file.filename},
+        "user_id": user.id,  # ✅ tag vectors with user_id
+    } for c in chunks]
     db.add(Document(id=str(uuid.uuid4()), uploader=user.email, filename=file.filename)); db.commit()
     count = upsert_documents_to_qdrant(payloads)
     return {"ok": True, "ingested_chunks": count}
@@ -538,7 +591,7 @@ def chat(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get
         raise HTTPException(status_code=403, detail="Admin cannot chat.")
     # RAG search
     try:
-        contexts = search_qdrant(body.message, limit=TOP_K)
+        contexts = search_qdrant(body.message, limit=TOP_K, user_id=user.id)
     except Exception as e:
         print("[RAG] search error:", e, traceback.format_exc())
         contexts = []
@@ -574,7 +627,7 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
     def gen():
         # RAG search
         try:
-            contexts = search_qdrant(body.message, limit=TOP_K)
+            contexts = search_qdrant(body.message, limit=TOP_K, user_id=user.id)
         except Exception as e:
             print("[RAG] search error:", e, traceback.format_exc())
             contexts = []
@@ -642,6 +695,11 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
     return StreamingResponse(gen(), media_type="application/jsonl")
 
 # ---------------- Chat Delete By USer----------------
+
+@app.delete("/admin/users/{user_id}/vectors")
+def admin_clear_user_vectors(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    delete_user_vectors(user_id)
+    return {"ok": True}
 
 @app.delete("/sessions/{session_id}")
 def delete_session(
@@ -908,6 +966,9 @@ def admin_list_users(db: Session = Depends(get_db), admin=Depends(require_admin)
 
 @app.delete("/admin/users/{user_id}")
 def admin_delete_user(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    # ✅ delete their vectors first
+    delete_user_vectors(user_id)
+
     db.query(Message).filter(Message.user_id == user_id).delete()
     db.query(Conversation).filter(Conversation.user_id == user_id).delete()
     db.query(QuestionnaireAttempt).filter(QuestionnaireAttempt.user_id == user_id).delete()
@@ -918,11 +979,19 @@ def admin_delete_user(user_id: int, db: Session = Depends(get_db), admin=Depends
 
 
 @app.delete("/admin/users/{user_id}/chats")
-def admin_clear_user_chats(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
+def admin_clear_user_chats(
+    user_id: int,
+    purge_vectors: bool = False,
+    db: Session = Depends(get_db),
+    admin=Depends(require_admin),
+):
     db.query(Message).filter(Message.user_id == user_id).delete()
     db.query(Conversation).filter(Conversation.user_id == user_id).delete()
     db.commit()
+    if purge_vectors:
+        delete_user_vectors(user_id)
     return {"ok": True}
+
 
 
 @app.delete("/admin/users/{user_id}/questionnaires")

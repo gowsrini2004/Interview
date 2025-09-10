@@ -23,7 +23,7 @@ if "token" not in st.session_state: st.session_state.token = None
 if "is_admin" not in st.session_state: st.session_state.is_admin = False
 if "session_id" not in st.session_state: st.session_state.session_id = None
 if "sessions" not in st.session_state: st.session_state.sessions = []
-if "provider" not in st.session_state: st.session_state.provider = "mistral"
+if "provider" not in st.session_state: st.session_state.provider = "groq"
 if "streaming" not in st.session_state: st.session_state.streaming = True
 if "view" not in st.session_state: st.session_state.view = "chat"  # chat | dashboard | admin
 if "username" not in st.session_state: st.session_state.username = ""
@@ -140,7 +140,7 @@ def render_modal_panel():
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Cancel"):
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
             with c2:
                 if st.button("Delete"):
                     if confirm.strip().upper() == "DELETE":
@@ -149,7 +149,7 @@ def render_modal_panel():
                             st.success("Vector DB cleared.")
                         else:
                             st.error("Failed to clear vector DB.")
-                        close_modal(); st.experimental_rerun()
+                        close_modal(); st.rerun()
                     else:
                         st.error("Please type DELETE to confirm.")
 
@@ -161,7 +161,7 @@ def render_modal_panel():
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Cancel"):
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
             with c2:
                 if st.button("Clear Chats"):
                     r = api_delete(f"/admin/users/{user_id}/chats")
@@ -169,7 +169,7 @@ def render_modal_panel():
                         st.success("Chats cleared.")
                     else:
                         st.error("Failed clearing chats.")
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
 
         elif mtype == "clear_questionnaires":
             email = data.get("email","")
@@ -179,7 +179,7 @@ def render_modal_panel():
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Cancel"):
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
             with c2:
                 if st.button("Clear Questionnaires"):
                     r = api_delete(f"/admin/users/{user_id}/questionnaires")
@@ -187,7 +187,7 @@ def render_modal_panel():
                         st.success("Questionnaires cleared.")
                     else:
                         st.error("Failed clearing questionnaires.")
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
 
         elif mtype == "user_actions":
             email = data.get("email","")
@@ -198,7 +198,7 @@ def render_modal_panel():
             c1, c2, c3 = st.columns([1,1,1])
             with c1:
                 if st.button("Close"):
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
             with c2:
                 if st.button("Update Password"):
                     if not new_pw:
@@ -209,7 +209,7 @@ def render_modal_panel():
                             st.success("Password updated.")
                         else:
                             st.error("Failed updating password.")
-                        close_modal(); st.experimental_rerun()
+                        close_modal(); st.rerun()
             with c3:
                 if st.button("Delete User"):
                     r = api_delete(f"/admin/users/{user_id}")
@@ -217,7 +217,7 @@ def render_modal_panel():
                         st.success("User deleted.")
                     else:
                         st.error("Failed deleting user.")
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
 
         elif mtype == "delete_conversation":
             sid = data.get("session_id")
@@ -228,7 +228,7 @@ def render_modal_panel():
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Cancel"):
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
             with c2:
                 if st.button("Delete"):
                     r = api_delete(f"/sessions/{sid}")
@@ -239,7 +239,7 @@ def render_modal_panel():
                         st.success("Conversation deleted.")
                     else:
                         st.error("Failed to delete conversation.")
-                    close_modal(); st.experimental_rerun()
+                    close_modal(); st.rerun()
 
     st.markdown("---")
 
@@ -275,7 +275,7 @@ if not st.session_state.token:
                     me = h.json().get("me", {})
                     st.session_state.username = me.get("username", "there")
                 st.session_state.view = "admin" if st.session_state.is_admin else "chat"
-                st.experimental_rerun()
+                st.rerun()
             else:
                 try:
                     st.error(r.json().get("detail", "Authentication error"))
@@ -295,7 +295,7 @@ with st.sidebar:
     # ======= top-right logout (outside sidebar) =======
     if st.button("Logout"):
             st.session_state.clear()
-            st.experimental_rerun()
+            st.rerun()
     greet_name = st.session_state.username or "there"
 
     # ACCOUNT
@@ -306,13 +306,13 @@ with st.sidebar:
             st.markdown("**Vector Store (Qdrant)**")
             st.caption("Delete the entire vector collection and document records.")
             if st.button("Clear Vector DB"):
-                open_modal("vector_clear"); st.experimental_rerun()
+                open_modal("vector_clear"); st.rerun()
         else:
                 st.markdown("**Model Provider**")
                 st.session_state.provider = st.selectbox(
                     "Choose provider",
                     ["groq","mistral"],
-                    index=(0 if st.session_state.provider == "mistral" else 1),
+                    index=0 if st.session_state.provider == "groq" else 1,
                 )
                 st.checkbox("Stream responses", value=st.session_state.streaming, key="streaming")
 
@@ -336,7 +336,7 @@ with st.sidebar:
                 st.caption("Answer at least 10 adaptive questions. Then continue (+3) or get your score.")
                 if st.button("📊 Your Dashboard"):
                         st.session_state.view = "dashboard"
-                        st.experimental_rerun()     
+                        st.rerun()     
                 if st.button("▶ Start Questionnaire"):
                         r = api_post("/questionnaire/start")
                         if r is not None and r.status_code == 200:
@@ -344,7 +344,7 @@ with st.sidebar:
                             st.session_state.q_session_id = data["session_id"]
                             st.session_state.session_id = data["session_id"]
                             st.session_state.view = "chat"
-                            st.experimental_rerun()
+                            st.rerun()
                 if st.session_state.q_session_id:
                     st.success("Questionnaire in progress.")
         
@@ -382,7 +382,7 @@ with st.sidebar:
                         if st.button(btn_label, key=f"chat_{row['id']}"):
                             st.session_state.view = "chat"
                             st.session_state.session_id = row["id"]
-                            st.experimental_rerun()
+                            st.rerun()
                     st.markdown("---")
 
 # -------- ADMIN view --------
@@ -419,14 +419,14 @@ if st.session_state.view == "admin":
         with c3: st.markdown(str(u["questionnaire_attempts"]))
         with c4:
             if st.button("Clear", key=f"cc_{u['id']}"):
-                open_modal("clear_chats", {"user_id": u["id"], "email": u["email"]}); st.experimental_rerun()
+                open_modal("clear_chats", {"user_id": u["id"], "email": u["email"]}); st.rerun()
         with c5:
             if st.button("Clear", key=f"cq_{u['id']}"):
-                open_modal("clear_questionnaires", {"user_id": u["id"], "email": u["email"]}); st.experimental_rerun()
+                open_modal("clear_questionnaires", {"user_id": u["id"], "email": u["email"]}); st.rerun()
         with c6:
             if st.button("⋯", key=f"menu_{u['id']}"):
                 st.session_state.actions_user = {"id": u["id"], "email": u["email"]}
-                open_modal("user_actions", {"user_id": u["id"], "email": u["email"]}); st.experimental_rerun()
+                open_modal("user_actions", {"user_id": u["id"], "email": u["email"]}); st.rerun()
 
     st.stop()
 
@@ -461,14 +461,14 @@ if not st.session_state.is_admin and st.session_state.session_id:
             if r is not None and r.status_code == 200:
                 refresh_sessions()
                 st.success("Title updated.")
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Failed to update title.")
     with cC:
         if st.button("Delete Chat", key=f"delete_chat_{st.session_state.session_id}"):
             st.session_state.del_conv_id = st.session_state.session_id
             open_modal("delete_conversation", {"session_id": st.session_state.session_id})
-            st.experimental_rerun()
+            st.rerun()
 
 # If an existing chat is open, render messages; otherwise show "no messages yet"
 if st.session_state.session_id and not st.session_state.is_admin:
@@ -517,7 +517,7 @@ if (not st.session_state.is_admin) and st.session_state.q_session_id and st.sess
                         st.markdown("**Tips**")
                         for t in tips: st.markdown(f"- {t}")
                 st.session_state.q_session_id = None
-                st.experimental_rerun()
+                st.rerun()
             else:
                 with st.chat_message("assistant"):
                     st.markdown(data.get("question","(next question)"))
@@ -558,14 +558,14 @@ elif not st.session_state.is_admin:
             # Ensure new conversation appears immediately
             if not st.session_state.session_id:
                 refresh_sessions_and_select_latest_if_needed()
-            st.experimental_rerun()
+            st.rerun()
         else:
             # non-streaming
             r = api_post("/chat", json={"message": user_msg, "session_id": st.session_state.session_id, "provider": st.session_state.provider})
             if r is not None and r.status_code == 200:
                 if not st.session_state.session_id:
                     refresh_sessions_and_select_latest_if_needed()
-                st.experimental_rerun()
+                st.rerun()
             else:
                 try: st.error(r.json().get("detail", "Server error"))
                 except Exception: st.error("Server error")
