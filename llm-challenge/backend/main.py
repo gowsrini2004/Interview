@@ -50,7 +50,7 @@ _groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else N
 CORS_ALLOWED_ORIGINS = os.getenv("CORS_ALLOWED_ORIGINS", "*").split(",")
 
 # Questionnaire rules
-MIN_QUESTIONS = 10           # minimum to reach before offering score
+MIN_QUESTIONS = 7          # minimum to reach before offering score
 CONTINUE_STEP = 3            # increment each time user says "continue"
 
 # ---------------- DB ----------------
@@ -849,8 +849,20 @@ def delete_session(
     return {"ok": True}
 
 # ---------------- Questionnaire logic ----------------
-Q_MARK = "<!--Q-->"                    # tag assistant questions
-CONTINUE_PROMPT_MARK = "<!--CONTINUE_PROMPT-->"  # tag "continue or score?" prompt
+
+def is_continue_prompt_text(text: str) -> bool:
+    """Detect our 'continue or score' prompt without using hidden markers."""
+    t = (text or "").strip().lower()
+    return ("reply with 'continue' or 'score'" in t) or t.startswith("you've answered")
+
+def is_regular_question_text(text: str) -> bool:
+    """Count only real questionnaire questions (end with ? and not a continue-prompt)."""
+    if not text:
+        return False
+    t = text.strip()
+    if not t.endswith("?"):
+        return False
+    return not is_continue_prompt_text(t)
 
 def q_system_prompt() -> str:
     return (
@@ -872,9 +884,7 @@ def _extract_qa_transcript(history_pairs: List[Dict[str, str]]) -> List[str]:
     t = []
     for m in history_pairs:
         if m["role"] == "assistant":
-            # Strip markers if present
-            c = m["content"].replace(Q_MARK, "").replace(CONTINUE_PROMPT_MARK, "").strip()
-            t.append(f"Q: {c}")
+            t.append(f"Q: {m['content'].strip()}")
         else:
             t.append(f"A: {m['content']}")
     return t
@@ -918,22 +928,31 @@ def questionnaire_start(user=Depends(get_current_user), db: Session = Depends(ge
     if is_admin_principal(user):
         raise HTTPException(status_code=403, detail="Admin cannot start questionnaires.")
     # Create a new conversation
-    conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title=f"[Questionnaire] {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}")
+    conv = Conversation(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        title=f"[Questionnaire] {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+    )
     db.add(conv); db.commit()
+
     # Create q_session row with target = MIN_QUESTIONS
     qs = QuestionnaireSession(session_id=conv.id, user_id=user.id, target_questions=MIN_QUESTIONS, is_active=1)
     db.add(qs); db.commit()
-    # First question
-    first_q = "To get started, how would you describe your overall mood today?" + Q_MARK
+
+    # First question (no markers)
+    first_q = "To get started, how would you describe your overall mood today?"
     db.add(Message(conversation_id=conv.id, user_id=user.id, role="assistant", content=first_q))
     db.commit()
-    return {"session_id": conv.id, "question": first_q.replace(Q_MARK, "")}
+
+    return {"session_id": conv.id, "question": first_q}
+
 
 
 @app.post("/questionnaire/answer", response_model=QAnswerOut)
 def questionnaire_answer(body: QAnswerIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     if is_admin_principal(user):
         raise HTTPException(status_code=403, detail="Admin cannot answer questionnaires.")
+
     # Append user answer
     db.add(Message(conversation_id=body.session_id, user_id=user.id, role="user", content=body.answer))
     db.commit()
@@ -946,33 +965,38 @@ def questionnaire_answer(body: QAnswerIn, user=Depends(get_current_user), db: Se
     if not qs or not qs.is_active:
         raise HTTPException(status_code=400, detail="Questionnaire session not active.")
 
-    # Load history
+    # Load history (assistant + user)
     hist = q_history(db, user.id, body.session_id)
 
-    # Determine if the latest answer was to a CONTINUE prompt
-    # Find the last assistant message before this user answer
+    # Find last assistant message before this user answer
     last_assistant = None
-    for m in reversed(hist[:-1]):  # exclude the just-added user message
+    for m in reversed(hist[:-1]):  # exclude just-added user message
         if m["role"] == "assistant":
             last_assistant = m["content"]
             break
 
-    # Count "actual" questions asked so far (assistant messages with Q_MARK)
-    actual_q_count = sum(1 for m in hist if m["role"] == "assistant" and Q_MARK in m["content"])
+    # Count actual questions asked so far (assistant messages that look like questions, not continue-prompt)
+    actual_q_count = sum(
+        1 for m in hist if m["role"] == "assistant" and is_regular_question_text(m["content"])
+    )
 
-    # If last assistant was the continue prompt, interpret the user's answer:
-    if last_assistant and CONTINUE_PROMPT_MARK in last_assistant:
+    # If last message was the continue prompt, interpret user's reply
+    if last_assistant and is_continue_prompt_text(last_assistant):
         ans = (body.answer or "").strip().lower()
+
         wants_continue = any(x in ans for x in ["continue", "yes", "y", "go on", "more", "add"])
-        if wants_continue:
+        wants_score    = any(x in ans for x in ["score", "finish", "end", "done", "result"])
+
+        if wants_continue and not wants_score:
             # bump target by 3 and ask next adaptive question
             qs.target_questions = (qs.target_questions or MIN_QUESTIONS) + CONTINUE_STEP
             db.commit()
-            q = next_question_from_llm(hist) + Q_MARK
+            q = next_question_from_llm(hist)
             db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=q))
             db.commit()
-            return {"done": False, "question": q.replace(Q_MARK, "")}
-        else:
+            return {"done": False, "question": q}
+
+        if wants_score and not wants_continue:
             # finalize now
             data = finalize_score_from_history(hist)
             score = float(data.get("score", 0.0))
@@ -989,22 +1013,32 @@ def questionnaire_answer(body: QAnswerIn, user=Depends(get_current_user), db: Se
             db.commit()
             return {"done": True, "score": score, "comment": comment, "tips": tips}
 
-    # If we reached at least target questions -> ask for continue or score
-    if actual_q_count >= (qs.target_questions or MIN_QUESTIONS):
-        prompt = (
+        # If unclear answer to continue prompt, politely re-ask the same continue question
+        prompt_text = (
             f"You've answered {actual_q_count} questions so far. "
-            f"Would you like to **continue** with {CONTINUE_STEP} more questions, or **get your score** now? "
+            f"Would you like to continue with {CONTINUE_STEP} more questions, or get your score now? "
             "Reply with 'continue' or 'score'."
-        ) + CONTINUE_PROMPT_MARK
-        db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=prompt))
+        )
+        db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=prompt_text))
         db.commit()
-        return {"done": False, "question": "continue or score?"}
+        return {"done": False, "question": prompt_text}
+
+    # If we've reached target, ask the clear 'continue or score' question (no markers)
+    if actual_q_count >= (qs.target_questions or MIN_QUESTIONS):
+        prompt_text = (
+            f"You've answered {actual_q_count} questions so far. "
+            f"Would you like to continue with {CONTINUE_STEP} more questions, or get your score now? "
+            "Reply with 'continue' or 'score'."
+        )
+        db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=prompt_text))
+        db.commit()
+        return {"done": False, "question": prompt_text}
 
     # Otherwise: ask next adaptive question
-    q = next_question_from_llm(hist) + Q_MARK
+    q = next_question_from_llm(hist)
     db.add(Message(conversation_id=body.session_id, user_id=user.id, role="assistant", content=q))
     db.commit()
-    return {"done": False, "question": q.replace(Q_MARK, "")}
+    return {"done": False, "question": q}
 
 
 # ---------------- Questionnaire dashboard (fast) ----------------
