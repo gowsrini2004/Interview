@@ -7,7 +7,7 @@ from typing import List, Optional, Literal, Dict, Any
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
@@ -15,6 +15,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from passlib.context import CryptContext
+from fastapi import Path
 import jwt
 import requests
 import traceback
@@ -156,15 +157,36 @@ def decode_token(token: str) -> str:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
+# Admin principal helper
+class AdminPrincipal:
+    id = -1
+    email = "admin"
+    is_admin = True
+
+
+def is_admin_principal(obj: Any) -> bool:
+    return getattr(obj, "email", None) == "admin" or getattr(obj, "is_admin", False) is True
+
+
 def get_current_user(
     creds: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)
-) -> User:
+):
     token = creds.credentials
-    email = decode_token(token)
-    user = db.query(User).filter(User.email == email).first()
+    sub = decode_token(token)
+    # Hardcoded admin principal
+    if sub == "admin":
+        return AdminPrincipal()
+    # Normal user
+    user = db.query(User).filter(User.email == sub).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
+
+
+def require_admin(user=Depends(get_current_user)):
+    if is_admin_principal(user):
+        return user
+    raise HTTPException(status_code=403, detail="Admin only")
 
 
 # ---------------- RAG ----------------
@@ -329,8 +351,9 @@ class RegisterIn(BaseModel):
     email: EmailStr
     password: str
 
+# CHANGED: allow username OR email for login
 class LoginIn(BaseModel):
-    email: EmailStr
+    identifier: str  # email OR "admin"
     password: str
 
 class ChatIn(BaseModel):
@@ -378,12 +401,16 @@ def username_from_email(email: str) -> str:
 
 # ---------------- Routes: meta ----------------
 @app.get("/health")
-def health(user: User = Depends(get_current_user)):
+def health(user=Depends(get_current_user)):
     return {
         "ok": True,
         "qdrant": init_qdrant() is not None,
         "embedder": init_embedder() is not None,
-        "me": {"email": user.email, "username": username_from_email(user.email)},
+        "me": {
+            "email": user.email if not is_admin_principal(user) else "admin",
+            "username": "admin" if is_admin_principal(user) else username_from_email(user.email),
+            "is_admin": is_admin_principal(user),
+        },
         "provider_defaults": {"mistral": OLLAMA_MODEL, "groq": GROQ_MODEL_DEFAULT if GROQ_API_KEY else None},
     }
 
@@ -397,20 +424,27 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     user = User(email=payload.email, password_hash=hash_password(payload.password))
     db.add(user); db.commit(); db.refresh(user)
     token = create_access_token(user.email)
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": token, "token_type": "bearer", "is_admin": False}
 
 @app.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email).first()
+    # Hardcoded admin login
+    if payload.identifier == "admin" and payload.password == "admin":
+        token = create_access_token("admin")
+        return {"access_token": token, "token_type": "bearer", "is_admin": True}
+
+    # Normal user flow
+    user = db.query(User).filter(User.email == payload.identifier).first()
     if not user or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid email/username or password")
     token = create_access_token(user.email)
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": token, "token_type": "bearer", "is_admin": False}
 
 # Aliases
 @app.post("/register")
 def register_alias(payload: RegisterIn, db: Session = Depends(get_db)):
     return register(payload, db)
+
 @app.post("/login")
 def login_alias(payload: LoginIn, db: Session = Depends(get_db)):
     return login(payload, db)
@@ -418,12 +452,17 @@ def login_alias(payload: LoginIn, db: Session = Depends(get_db)):
 
 # ---------------- Sessions/Chats ----------------
 @app.get("/sessions")
-def list_sessions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_sessions(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    # Admin has no personal sessions; return empty list
+    if is_admin_principal(user):
+        return []
     rows = db.query(Conversation).filter(Conversation.user_id == user.id).order_by(Conversation.created_at.desc()).all()
     return [{"id": r.id, "title": r.title, "created_at": r.created_at.isoformat()} for r in rows]
 
 @app.get("/sessions/{session_id}/messages")
-def session_messages(session_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def session_messages(session_id: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admins don't have chat history.")
     msgs = (
         db.query(Message)
         .filter(Message.conversation_id == session_id, Message.user_id == user.id)
@@ -433,7 +472,9 @@ def session_messages(session_id: str, user: User = Depends(get_current_user), db
     return [{"role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in msgs]
 
 @app.patch("/sessions/{session_id}")
-def update_session_title(session_id: str, payload: UpdateTitleIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def update_session_title(session_id: str, payload: UpdateTitleIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admins cannot rename user sessions.")
     conv = db.query(Conversation).filter(Conversation.id == session_id, Conversation.user_id == user.id).first()
     if not conv:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -444,7 +485,9 @@ def update_session_title(session_id: str, payload: UpdateTitleIn, user: User = D
 
 # ---------------- Ingest ----------------
 @app.post("/ingest")
-def ingest(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def ingest(file: UploadFile = File(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admin cannot ingest documents.")
     if not file.filename.lower().endswith(".txt"):
         raise HTTPException(status_code=400, detail="Only .txt supported.")
     raw = file.file.read().decode("utf-8", errors="ignore")
@@ -490,7 +533,9 @@ def build_prompt(body_message: str, contexts: List[dict]) -> str:
     )
 
 @app.post("/chat", response_model=ChatOut)
-def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def chat(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admin cannot chat.")
     # RAG search
     try:
         contexts = search_qdrant(body.message, limit=TOP_K)
@@ -523,7 +568,9 @@ def chat(body: ChatIn, user: User = Depends(get_current_user), db: Session = Dep
 
 
 @app.post("/chat_stream")
-def chat_stream(body: ChatIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admin cannot chat.")
     def gen():
         # RAG search
         try:
@@ -594,6 +641,35 @@ def chat_stream(body: ChatIn, user: User = Depends(get_current_user), db: Sessio
 
     return StreamingResponse(gen(), media_type="application/jsonl")
 
+# ---------------- Chat Delete By USer----------------
+
+@app.delete("/sessions/{session_id}")
+def delete_session(
+    session_id: str = Path(...),
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admins cannot delete user sessions.")
+
+    conv = (
+        db.query(Conversation)
+        .filter(Conversation.id == session_id, Conversation.user_id == user.id)
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # delete messages belonging to this user & conversation
+    db.query(Message).filter(
+        Message.conversation_id == session_id,
+        Message.user_id == user.id
+    ).delete()
+
+    # delete the conversation row
+    db.delete(conv)
+    db.commit()
+    return {"ok": True}
 
 # ---------------- Questionnaire logic ----------------
 Q_MARK = "<!--Q-->"                    # tag assistant questions
@@ -661,7 +737,9 @@ def finalize_score_from_history(history_pairs: List[Dict[str, str]]) -> Dict[str
 
 
 @app.post("/questionnaire/start", response_model=QStartOut)
-def questionnaire_start(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def questionnaire_start(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admin cannot start questionnaires.")
     # Create a new conversation
     conv = Conversation(id=str(uuid.uuid4()), user_id=user.id, title=f"[Questionnaire] {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}")
     db.add(conv); db.commit()
@@ -676,7 +754,9 @@ def questionnaire_start(user: User = Depends(get_current_user), db: Session = De
 
 
 @app.post("/questionnaire/answer", response_model=QAnswerOut)
-def questionnaire_answer(body: QAnswerIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def questionnaire_answer(body: QAnswerIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admin cannot answer questionnaires.")
     # Append user answer
     db.add(Message(conversation_id=body.session_id, user_id=user.id, role="user", content=body.answer))
     db.commit()
@@ -758,7 +838,9 @@ class QDashItem(BaseModel):
     latest_comment: Optional[str] = None
 
 @app.get("/questionnaire/dashboard", response_model=List[QDashItem])
-def questionnaire_dashboard(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def questionnaire_dashboard(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        return []
     # AVG + COUNT per day
     agg_rows = (
         db.query(
@@ -800,3 +882,77 @@ def questionnaire_dashboard(user: User = Depends(get_current_user), db: Session 
             "latest_comment": latest_map.get(r.day, None),
         })
     return out
+
+
+# ---------------- Admin Endpoints ----------------
+@app.get("/admin/users")
+def admin_list_users(db: Session = Depends(get_db), admin=Depends(require_admin)):
+    users = db.query(User).order_by(User.created_at.desc()).all()
+    out = []
+    for u in users:
+        chat_cnt = db.query(Conversation).filter(Conversation.user_id == u.id).count()
+        msg_cnt = db.query(Message).filter(Message.user_id == u.id).count()
+        qa_cnt = db.query(QuestionnaireAttempt).filter(QuestionnaireAttempt.user_id == u.id).count()
+        active_qs = db.query(QuestionnaireSession).filter(QuestionnaireSession.user_id == u.id, QuestionnaireSession.is_active == 1).count()
+        out.append({
+            "id": u.id,
+            "email": u.email,
+            "created_at": u.created_at.isoformat(),
+            "conversations": chat_cnt,
+            "messages": msg_cnt,
+            "questionnaire_attempts": qa_cnt,
+            "active_questionnaires": active_qs
+        })
+    return out
+
+
+@app.delete("/admin/users/{user_id}")
+def admin_delete_user(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    db.query(Message).filter(Message.user_id == user_id).delete()
+    db.query(Conversation).filter(Conversation.user_id == user_id).delete()
+    db.query(QuestionnaireAttempt).filter(QuestionnaireAttempt.user_id == user_id).delete()
+    db.query(QuestionnaireSession).filter(QuestionnaireSession.user_id == user_id).delete()
+    db.query(User).filter(User.id == user_id).delete()
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/admin/users/{user_id}/chats")
+def admin_clear_user_chats(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    db.query(Message).filter(Message.user_id == user_id).delete()
+    db.query(Conversation).filter(Conversation.user_id == user_id).delete()
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/admin/users/{user_id}/questionnaires")
+def admin_clear_user_questionnaires(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    db.query(QuestionnaireAttempt).filter(QuestionnaireAttempt.user_id == user_id).delete()
+    db.query(QuestionnaireSession).filter(QuestionnaireSession.user_id == user_id).delete()
+    db.commit()
+    return {"ok": True}
+
+
+@app.patch("/admin/users/{user_id}/password")
+def admin_update_user_password(user_id: int, new_pw: str = Body(..., embed=True), db: Session = Depends(get_db), admin=Depends(require_admin)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.password_hash = hash_password(new_pw)
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/admin/vectorstore")
+def admin_clear_vector_db(db: Session = Depends(get_db), admin=Depends(require_admin)):
+    qc = init_qdrant()
+    if qc:
+        try:
+            qc.delete_collection(COLLECTION)
+        except Exception:
+            # ignore if already deleted
+            pass
+    # also clear Document metadata table since they correspond to the vector store
+    db.query(Document).delete()
+    db.commit()
+    return {"ok": True, "message": f"Vector collection '{COLLECTION}' deleted and document records cleared."}
