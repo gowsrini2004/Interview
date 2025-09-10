@@ -1,18 +1,15 @@
-# app.py — Streamlit Frontend (dual sidebar; no @st.dialog; version-agnostic modals)
-# ACCOUNT > greeting, optional Setup (users) or Vector tools (admin)
-# YOUR CHATS > Tabs: Questionnaire | Chats (date-wise groups)
-# Includes: admin panel, pseudo-modals (no @st.dialog), grouped chats, convo header actions,
-# and refresh/selection fixes so new chats appear immediately.
-
 import os
 import json
 import requests
+import time
+import streamlit.components.v1 as components
 import streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from collections import defaultdict
-from datetime import datetime
 from zoneinfo import ZoneInfo
+from pathlib import Path
+import base64
 # ---------- sensible defaults ----------
 def ensure_session_defaults():
     st.session_state.setdefault("username", "")
@@ -62,6 +59,315 @@ SOURCES_MARKER_PREFIX = "<!--SOURCES_JSON:"
 SOURCES_MARKER_SUFFIX = "-->"
 
 # -------- helpers --------
+def _now_ts():
+    return int(time.time())
+
+# ---------------- Full meditation page ----------------
+def render_meditation_page():
+    """
+    Updated meditation page:
+     - Guided page: video + step prompts; Speak Steps button uses browser SpeechSynthesis to speak them.
+     - After speaking (or directly), user can press Enter Meditation Room (Start) to begin room session.
+     - Meditation Room: improved audio element injection with controls & JS play attempt.
+    """
+
+    # --- session keys
+    st.session_state.setdefault("med_page", None)
+    st.session_state.setdefault("view", "chat")
+
+    # Guided state
+    st.session_state.setdefault("guided_minutes", 10)
+    st.session_state.setdefault("guided_steps", 5)
+    # A flag set in-memory (per-run) to indicate step-speech was played. If you navigate away it resets.
+    # Use an explicit session key:
+    st.session_state.setdefault("guided_spoken", False)
+
+    # Room state
+    st.session_state.setdefault("room_start_ts", None)
+    st.session_state.setdefault("room_end_ts", None)
+    st.session_state.setdefault("room_is_running", False)
+    st.session_state.setdefault("room_sound_choice", "Omkara (chant)")
+    st.session_state.setdefault("room_minutes", 15)
+
+    st.title("🧘 Meditation Space")
+
+    # Back
+    if st.button("⬅ Back to Dashboard", key="med_back_v2"):
+        st.session_state.view = "chat"
+        st.rerun()
+
+
+    # ---------------- GUIDED PAGE ----------------
+    if st.session_state.med_page == "guided":
+        st.header("📖 Guided Meditation — Learn the steps")
+
+        # Show video (optional)
+        st.video("https://www.youtube.com/watch?v=inpok4MKVLM")
+
+        st.markdown("Select duration and number of steps. Then listen to the steps (🔊 Speak Steps). When ready, press **Enter Meditation Room (Start)** to begin your practice with the chosen length & sound.")
+
+        steps = st.slider("Number of steps", min_value=1, max_value=12, value=st.session_state.guided_steps, key="guided_steps_slider")
+
+        st.session_state.guided_steps = steps
+
+        # generate simple step prompts (you can refine text)
+        base_prompts = [
+            "Breathe in slowly and deeply, then breathe out fully.",
+            "Scan your body from head to toes, releasing tension.",
+            "Bring awareness to the breath — feel the belly or chest rising.",
+            "If thoughts arise, label them and gently return to the breath.",
+            "Soften the jaw and shoulders, relax the face, and let the breath be natural."
+        ]
+        prompts = [base_prompts[(i) % len(base_prompts)] for i in range(steps)]
+
+        st.markdown("**Steps you'll practice**")
+        for i, p in enumerate(prompts, start=1):
+            st.markdown(f"**Step {i}:** {p}")
+
+        # --- Speak Steps button: uses SpeechSynthesis in the browser
+        # It will read each step with a short pause. After speech finishes user can press the Enter button.
+        speak_button = st.button("🔊 Speak Steps", key="speak_steps_btn")
+        if speak_button:
+            # create javascript to speak the steps sequentially
+            # We join steps with a small pause; SpeechSynthesis is used (works in modern browsers)
+            joined = " <break> ".join(prompts)  # break token for readability; we'll use setTimeout pauses
+            # Build JS that speaks each sentence sequentially (with pause) and then sets a visible flag in the DOM.
+            # We cannot directly set st.session_state from JS, so we set a simple visual message and set guided_spoken=True on next run.
+            js = f"""
+            <script>
+            const prompts = {prompts};
+            // speak each prompt sequentially
+            const synth = window.speechSynthesis;
+            let idx = 0;
+            function speakNext() {{
+                if(idx >= prompts.length) {{
+                    // done - create a small visible DOM element so user sees it's finished
+                    const doneDiv = document.createElement('div');
+                    doneDiv.id = 'guided_spoken_done';
+                    doneDiv.innerText = '🔊 Steps spoken. You can now enter the Meditation Room below.';
+                    doneDiv.style.color = 'green';
+                    document.body.appendChild(doneDiv);
+                    return;
+                }}
+                const u = new SpeechSynthesisUtterance(prompts[idx]);
+                u.rate = 0.95;
+                u.pitch = 1.0;
+                u.volume = 1.0;
+                u.onend = function(e) {{
+                    // small pause then next
+                    setTimeout(function(){{ idx++; speakNext(); }}, 700);
+                }};
+                synth.speak(u);
+            }}
+            // start speaking after a short delay
+            setTimeout(function(){{ speakNext(); }}, 200);
+            </script>
+            """
+            components.html(js, height=40)
+            # note: JS runs in embedded component; we also set a server-side flag so UI can show a note
+            st.session_state.guided_spoken = True
+            st.success("Speaking steps in your browser. Wait for the spoken steps to finish; then press Enter Meditation Room (Start).")
+
+        # Button to go to Meditation Room *and start* the session with these chosen minutes
+        if st.button("➡️ Enter Meditation Room (Start)"):
+            # Setup room session using guided choices
+
+            # you can choose a default sound if you want
+            st.session_state.room_sound_choice = "Omkara (chant)"
+            st.session_state.med_page = "room"
+            st.rerun()
+
+    # ---------------- MEDITATION ROOM (local only with controlled looping) ----------------
+    if st.session_state.med_page == "room":
+        st.header("🏯 Meditation Room — Practice")
+
+        # project root = go up from frontend/
+        BASE_DIR = Path(__file__).resolve().parent.parent
+        SOURCES_DIR = BASE_DIR / "sources"
+
+        # map display names to file paths
+        sound_map = {
+            "Omkara (chant)": SOURCES_DIR / "om.mp3",
+            "Natural (forest / rain)": SOURCES_DIR / "rain_sound.mp3",
+            "40Hz Tone (focus)": SOURCES_DIR / "gamma.mp3",
+        }
+
+        # select sound
+        sound_names = list(sound_map.keys())
+        default_index = (
+            sound_names.index(st.session_state.room_sound_choice)
+            if st.session_state.room_sound_choice in sound_names else 0
+        )
+        sound_choice = st.selectbox(
+            "Choose background sound",
+            sound_names,
+            index=default_index,
+            key="room_sound_select"
+        )
+        st.session_state.room_sound_choice = sound_choice
+        chosen_path = sound_map.get(sound_choice)
+
+        # loop option
+        loop_enabled = st.checkbox("🔁 Loop background sound", value=False, key="room_loop_checkbox")
+
+        # ---- Timer / session state ----
+        if not st.session_state.room_is_running:
+            if st.button("▶ Start Meditation Room", key="room_start_btn"):
+                start_ts = _now_ts()
+                st.session_state.room_start_ts = start_ts
+                st.session_state.room_is_running = True
+                st.session_state.room_loop_enabled = loop_enabled
+                st.success("Meditation room started.")
+                st.info(f"Started at: **{datetime.fromtimestamp(start_ts).strftime('%H:%M:%S')}**")
+        else:
+            now = _now_ts()
+            start_ts = st.session_state.room_start_ts
+
+
+            
+
+        # ---- Local audio playback (ONLY if running) ----
+        if st.session_state.room_is_running and chosen_path and chosen_path.exists():
+            st.markdown(f"**Background sound: {sound_choice}**")
+            try:
+                with open(chosen_path, "rb") as f:
+                    audio_bytes = f.read()
+                b64 = base64.b64encode(audio_bytes).decode()
+
+                loop_attr = "loop" if st.session_state.get("room_loop_enabled", False) else ""
+
+                audio_html = f"""
+                <audio autoplay {loop_attr} controls id="bg_audio">
+                    <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+                    Your browser does not support the audio element.
+                </audio>
+                """
+                components.html(audio_html, height=80)
+            except Exception as e:
+                st.error(f"Failed to load audio: {e}")
+        elif st.session_state.room_is_running:
+            st.warning("⚠️ Selected audio file not found in sources/ folder.")
+
+        # ---- Controls ----
+        if st.button("⏹ Stop Meditation", key="room_stop_btn"):
+            st.session_state.room_start_ts = None
+            st.session_state.room_end_ts = None
+            st.session_state.room_is_running = False
+            # stop audio explicitly by rendering a silent <audio> element
+            components.html("<audio id='bg_audio'></audio>", height=0)
+            st.success("Meditation stopped. To restart, press Start.")
+            st.rerun()
+
+        # ---- Auto-finish ----
+        if st.session_state.room_is_running and st.session_state.room_end_ts:
+            now = _now_ts()
+            if now >= st.session_state.room_end_ts:
+                st.balloons()
+                st.success("🪷 Meditation finished.")
+                st.session_state.room_start_ts = None
+                st.session_state.room_end_ts = None
+                st.session_state.room_is_running = False
+                # stop audio at end
+                components.html("<audio id='bg_audio'></audio>", height=0)
+
+
+import streamlit as st
+
+def render_yoga_page():
+    """
+    Yoga page: user selects type of yoga, displays corresponding videos and description.
+    """
+    st.title("🧘 Yoga Studio")
+
+    # Back button
+    if st.button("⬅ Back to Dashboard", key="yoga_back"):
+        st.session_state.view = "chat"
+        st.experimental_rerun()
+
+    st.subheader("Select the type of Yoga you want to practice:")
+
+    yoga_types = [
+        "Basic Asanas",
+        "Advanced Asanas",
+        "Surya Namaskar",
+        "Pranayama Breathing",
+        "Yoga for Flexibility"
+    ]
+
+    selection = st.selectbox("Choose Yoga Type", yoga_types, key="yoga_type_select")
+
+    # Define videos and descriptions for each type (multiple videos)
+    yoga_videos = {
+        "Basic Asanas": [
+            {
+                "title": "Basic Yoga for Beginners",
+                "url": "https://www.youtube.com/watch?v=v7AYKMP6rOE",
+                "description": "Learn simple yoga poses suitable for beginners."
+            },
+            {
+                "title": "10-Minute Beginner Yoga",
+                "url": "https://www.youtube.com/watch?v=4pKly2JojMw",
+                "description": "Quick session for daily beginner practice."
+            }
+        ],
+        "Advanced Asanas": [
+            {
+                "title": "Advanced Yoga Poses",
+                "url": "https://youtu.be/nY1z7LXhmGc?si=Ig4b7s5mwTk9qrQe",
+                "description": "Challenging yoga poses for experienced practitioners."
+            },
+            {
+                "title": "Yoga Challenge for Advanced Users",
+                "url": "https://youtu.be/MVVi5Ikq2TU?si=ZCawoId93eVXUKeX",
+                "description": "Advanced asanas with flow sequences."
+            }
+        ],
+        "Surya Namaskar": [
+            {
+                "title": "Sun Salutation (Surya Namaskar)",
+                "url": "https://youtu.be/38GTnjg_aBA?si=AlGjmiSxfGzB6PWQ",
+                "description": "A full Surya Namaskar routine to energize your morning."
+            },
+            {
+                "title": "Surya Namaskar Flow with Breath",
+                "url": "https://youtu.be/YAq_oCjnkWY?si=LNg4BCIU01togUAG",
+                "description": "Focus on synchronized breathing with Sun Salutations."
+            }
+        ],
+        "Pranayama Breathing": [
+            {
+                "title": "Pranayama Breathing Techniques",
+                "url": "https://youtu.be/395ZloN4Rr8?si=lbbErJ8eXN43JrfC",
+                "description": "Learn controlled breathing exercises for relaxation."
+            },
+            {
+                "title": "Advanced Pranayama Practice",
+                "url": "https://youtu.be/I77hh5I69gA?si=SIqKr6IBLNi0RA4M",
+                "description": "Extended breathing techniques to improve lung capacity."
+            }
+        ],
+        "Yoga for Flexibility": [
+            {
+                "title": "Full Body Yoga Stretch",
+                "url": "https://youtu.be/uKVAT9sghQ0?si=1B0jFLUZmYOtJv1W",
+                "description": "Yoga routine to increase overall flexibility."
+            },
+            {
+                "title": "Morning Flexibility Yoga Flow",
+                "url": "https://youtu.be/0h7taISrO7c?si=s67aQI7p7j50E_v7",
+                "description": "Quick morning session to loosen stiff muscles."
+            }
+        ]
+    }
+
+    st.markdown(f"### Videos for: **{selection}**")
+    for vid in yoga_videos.get(selection, []):
+        st.markdown(f"**{vid['title']}**")
+        st.video(vid["url"])
+        st.markdown(f"*{vid['description']}*")
+        st.markdown("---")
+
+                
 def auth_headers():
     return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
 
@@ -348,7 +654,7 @@ def render_sidebar():
                         else:
                             st.error("Failed to send daily summaries")
 
-                if st.button("Send Summary (overall + monthly)"):
+                if st.button("Send Summary (overall)"):
                         r = api_post("/admin/emails/periodic-summaries")
                         if r is not None and r.status_code == 200:
                             st.success(f"Sent: {r.json().get('sent', 0)}")
@@ -417,6 +723,19 @@ def render_sidebar():
                 if st.button("🎬 Open Library", key="btn_videos_user", use_container_width=True):
                     st.session_state.view = "videos"
                     st.rerun()
+                    
+            with st.sidebar:
+                with st.expander("🧘 Meditate", expanded=False):
+                    if st.button("🧘 Guided Meditation"):
+                        st.session_state.view = "meditation"; st.session_state.med_page = "guided"; st.rerun()
+                    if st.button("⛩ Meditation Room"):
+                        st.session_state.view = "meditation"; st.session_state.med_page = "room"; st.rerun()
+                        
+            with st.expander("ૐ Yoga", expanded=False):
+                if st.button("🧘Open Yoga Studio", key="sidebar_yoga"):
+                    st.session_state.view = "yoga"
+                    st.rerun()
+
 
             # Your Chats (User only)
             with st.expander("🤖 Your Chats", expanded=False):
@@ -572,6 +891,17 @@ if st.session_state.view == "dashboard":
         st.dataframe(df, use_container_width=True, hide_index=True)
     st.stop()
     
+
+# -------- Meditate view --------
+if st.session_state.view == "meditation":
+    render_meditation_page()
+    st.stop()
+    
+if st.session_state.view == "yoga":
+    render_yoga_page()
+    st.stop()
+    
+    
 # -------- videos view --------
 if st.session_state.view == "videos":
     st.subheader("🎬 Video Library")
@@ -602,6 +932,9 @@ if st.session_state.view == "videos":
                     except Exception: st.error("Server error while adding video")
 
     # Search
+    if st.button("⬅ Back to Dashboard", key="med_back_v2"):
+        st.session_state.view = "chat"
+        st.rerun()
     q = st.text_input("Search videos (title / description / tags)", key="video_search", placeholder="e.g., anxiety, breathing")
     params = {"q": q} if q else None
     with st.spinner("Loading videos…"):
