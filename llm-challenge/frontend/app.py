@@ -485,13 +485,28 @@ if st.session_state.session_id and not st.session_state.is_admin:
             clean, items = split_reply_and_sources(text)
             with st.chat_message("assistant"):
                 st.markdown(clean)
+
                 if items:
-                    with st.expander("📚 Sources"):
-                        for i, it in enumerate(items, start=1):
-                            st.markdown(f"**{i}. {it.get('filename','')}**")
-                            ex = it.get("excerpt","")
-                            if ex:
-                                st.markdown(f"> {ex}")
+                    with st.expander("📚 Sources", expanded=False):
+                        # Title line as blockquote
+                        st.markdown("> Sources")
+
+                        # Items are already the exact cited subset in order of first appearance
+                        for it in items:
+                            idx = it.get("index") or 0
+                            excerpt = it.get("excerpt", "")
+                            fname = it.get("filename", "")
+                            vid = it.get("id") or ""
+
+                            # Line 1: "n - excerpt"
+                            st.markdown(f"{idx} - {excerpt}")
+
+                            # Line 2: "   - File name (vector id)"
+                            # Use non-breaking spaces to indent in markdown
+                            if fname or vid:
+                                st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;- {fname}{f' ({vid})' if vid else ''}",
+                                            unsafe_allow_html=True)
+
                 st.caption(ts)
 else:
     if not st.session_state.is_admin:

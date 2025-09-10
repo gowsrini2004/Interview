@@ -1,13 +1,14 @@
 import os
 import uuid
 import json
+import re
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Literal, Dict, Any
 
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Body, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
@@ -15,7 +16,6 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from passlib.context import CryptContext
-from fastapi import Path
 import jwt
 import requests
 import traceback
@@ -309,6 +309,7 @@ SOURCES_MARKER_PREFIX = "<!--SOURCES_JSON:"
 SOURCES_MARKER_SUFFIX = "-->"
 
 def build_source_items(contexts: List[dict]) -> List[dict]:
+    """(Legacy helper) Not used for rendering anymore; kept for compatibility."""
     items = []
     for c in contexts:
         meta = c.get("meta") or {}
@@ -318,12 +319,138 @@ def build_source_items(contexts: List[dict]) -> List[dict]:
         items.append({"filename": fname, "excerpt": excerpt})
     return items
 
-def append_sources_marker(reply_text: str, contexts: List[dict]) -> str:
-    items = build_source_items(contexts)
+# -------------- NEW helpers for numbered citations & OOC prefix --------------
+OOC_PREFIX = "🌐 I couldn’t find context in your uploaded sources — this answer is drawn from general knowledge!!"
+
+
+def is_out_of_context(contexts: List[dict]) -> bool:
+    best_score = max((c.get("score", 0.0) for c in contexts), default=0.0)
+    return (best_score < OUT_OF_CONTEXT_THRESHOLD) or (not contexts)
+
+def _number_contexts(contexts: List[dict]) -> List[dict]:
+    """Return contexts[:TOP_K] with an added 1-based 'index' key."""
+    ordered = []
+    for i, c in enumerate(contexts[:TOP_K], start=0):
+        cc = dict(c)
+        cc["index"] = i
+        ordered.append(cc)
+    return ordered
+
+def build_prompt_with_numbered_context(user_msg: str, contexts: List[dict]) -> tuple[str, List[dict], bool]:
+    """
+    Returns: (prompt, numbered_contexts, out_of_context_flag)
+    - numbered_contexts: contexts[:TOP_K] with .index
+    - prompt instructs the model to cite using [n] and to emit OOC_PREFIX if out-of-context
+    """
+    system_prompt = (
+        "You are a compassionate, knowledgeable mental wellness assistant. "
+        "Prefer concise, practical guidance. "
+        "When you use information from a provided source, append the citation marker like [1], [2] "
+        "exactly matching the numbered CONTEXT SOURCES below. "
+        "Do not invent citation numbers. If a statement is general knowledge, do not cite it."
+    )
+
+    numbered = _number_contexts(contexts)
+    ooc = is_out_of_context(contexts)
+
+    if ooc:
+        # Explicitly instruct the first line with emoji
+        prompt = (
+            f"SYSTEM:\n{system_prompt}\n\n"
+            f"USER:\n{user_msg}\n\n"
+            "ASSISTANT:\n"
+            f"Begin your response with EXACTLY this line followed by a blank line:\n"
+            f"\"{OOC_PREFIX}\"\n\n"
+            "Then provide a clear, supportive answer based on general knowledge only. "
+            "Do not add any [n] citations because no uploaded context is being used."
+        )
+        return prompt, numbered, True
+
+    # Build a compact numbered context block
+    blocks = []
+    for c in numbered:
+        meta = c.get("meta") or {}
+        src = meta.get("filename") or meta.get("uploader") or c.get("id")
+        text = (c.get("text") or "")[:800]
+        score = float(c.get("score") or 0.0)
+        blocks.append(f"[{c['index']}] filename={src} score={score:.4f}\n{text}")
+    ctx = "\n\n".join(blocks)
+
+    prompt = (
+        f"SYSTEM:\n{system_prompt}\n\n"
+        f"CONTEXT SOURCES (numbered):\n{ctx}\n\n"
+        f"USER:\n{user_msg}\n\n"
+        "ASSISTANT:\nUse the numbered sources above where appropriate; append [n] after the relevant sentence. "
+        "Only cite numbers that exist in the context. If a statement is not supported by the context, don't cite."
+    )
+    return prompt, numbered, False
+
+
+def append_cited_sources_marker(reply_text: str, numbered_contexts: List[dict]) -> str:
+    """
+    Scan reply for [n] citations and attach ONLY those sources as JSON in the marker.
+    Keeps order of first appearance. Each item: {index, excerpt, filename, id}
+    """
+    if not reply_text or not numbered_contexts:
+        return reply_text
+
+    pat_num = re.compile(r"\[(\d+)\]")
+    pat_legacy = re.compile(r"\[source(\d+)\]", re.IGNORECASE)
+
+    seen: List[int] = []
+    for m in pat_num.finditer(reply_text):
+        i = int(m.group(1))
+        if i not in seen:
+            seen.append(i)
+    for m in pat_legacy.finditer(reply_text):
+        i = int(m.group(1))
+        if i not in seen:
+            seen.append(i)
+
+    if not seen:
+        return reply_text
+
+    by_index = {c["index"]: c for c in numbered_contexts}
+    items = []
+    for idx in seen:
+        c = by_index.get(idx)
+        if not c:
+            continue
+        text = (c.get("text") or "").strip().replace("\n", " ")
+        excerpt = text[:280] + ("…" if len(text) > 280 else "")
+        meta = c.get("meta") or {}
+        fname = meta.get("filename") or meta.get("uploader") or c.get("id")
+        items.append({
+            "index": idx,
+            "excerpt": excerpt,
+            "filename": fname,
+            "id": c.get("id")
+        })
+
     if not items:
         return reply_text
+
     payload = json.dumps(items, ensure_ascii=False)
     return f"{reply_text}\n\n{SOURCES_MARKER_PREFIX}{payload}{SOURCES_MARKER_SUFFIX}"
+
+
+def split_reply_and_sources_for_api(text: str) -> tuple[str, List[dict]]:
+    """Split assistant reply and extract JSON source items from marker."""
+    if not text:
+        return text, []
+    start = text.rfind(SOURCES_MARKER_PREFIX)
+    if start == -1:
+        return text, []
+    end = text.find(SOURCES_MARKER_SUFFIX, start)
+    if end == -1:
+        return text, []
+    try:
+        payload = text[start + len(SOURCES_MARKER_PREFIX): end]
+        items = json.loads(payload)
+        clean = text[:start].rstrip()
+        return clean, items if isinstance(items, list) else []
+    except Exception:
+        return text, []
 
 
 # ---------------- LLMs ----------------
@@ -551,40 +678,7 @@ def ingest(file: UploadFile = File(...), user=Depends(get_current_user), db: Ses
     return {"ok": True, "ingested_chunks": count}
 
 
-# ---------------- Chat (no session created until first message) ----------------
-def build_prompt(body_message: str, contexts: List[dict]) -> str:
-    system_prompt = (
-        "You are a compassionate, knowledgeable mental wellness assistant. Give well-structured, practical, "
-        "non-clinical advice. If content refers to documented sources, cite them as [source1], [source2], etc. "
-        "If user is in crisis, advise contacting local emergency services."
-    )
-    best_score = max((c["score"] for c in contexts), default=0.0)
-    is_out = best_score < OUT_OF_CONTEXT_THRESHOLD
-
-    if is_out or not contexts:
-        return (
-            f"SYSTEM:\n{system_prompt}\n\n"
-            f"USER:\n{body_message}\n\n"
-            "ASSISTANT:\nProvide a clear, supportive answer. "
-            "Note: This answer is based on general knowledge and not from your uploaded documents."
-        )
-    MAX_CTX = 2000
-    used = 0; blocks = []
-    for i, c in enumerate(contexts[:TOP_K], start=1):
-        meta = c.get("meta", {})
-        src = meta.get("filename") or meta.get("uploader") or c.get("id")
-        text = (c["text"] or "")[:800]
-        block = f"[source{i}] filename={src} score={c['score']:.4f}\n{text}"
-        if used + len(block) > MAX_CTX: break
-        blocks.append(block); used += len(block)
-    ctx = "\n\n".join(blocks)
-    return (
-        f"SYSTEM:\n{system_prompt}\n\n"
-        f"CONTEXT:\n{ctx}\n\n"
-        f"USER:\n{body_message}\n\n"
-        "ASSISTANT:\nUse the context above; cite like [source1]."
-    )
-
+# ---------------- Chat (updated: numbered citations + emoji OOC prefix) ----------------
 @app.post("/chat", response_model=ChatOut)
 def chat(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get_db)):
     if is_admin_principal(user):
@@ -596,10 +690,17 @@ def chat(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get
         print("[RAG] search error:", e, traceback.format_exc())
         contexts = []
 
-    prompt = build_prompt(body.message, contexts)
+    prompt, numbered_ctx, ooc = build_prompt_with_numbered_context(body.message, contexts)
     max_toks = body.num_predict or 512
-    reply = call_groq(prompt, num_predict=max_toks) if body.provider == "groq" else call_ollama(prompt, num_predict=max_toks)
-    reply_with_marker = append_sources_marker(reply, contexts)
+    raw_reply = call_groq(prompt, num_predict=max_toks) if body.provider == "groq" else call_ollama(prompt, num_predict=max_toks)
+
+    # Guarantee first line for out-of-context
+    reply = (raw_reply or "").strip()
+    if ooc and not reply.startswith(OOC_PREFIX):
+        reply = f"{OOC_PREFIX}\n\n{reply}"
+
+    # Attach ONLY cited sources (based on [n] in reply)
+    reply_with_marker = append_cited_sources_marker(reply, numbered_ctx)
 
     # Create a conversation ONLY NOW (first message), if missing
     conv_id = body.session_id
@@ -617,7 +718,9 @@ def chat(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get
     except Exception as e:
         print("[DB] save failed:", e, traceback.format_exc())
 
-    return {"reply": reply_with_marker, "sources": build_source_items(contexts)}
+    # Build sources payload for response model (only cited)
+    _, items = split_reply_and_sources_for_api(reply_with_marker)
+    return {"reply": reply_with_marker, "sources": items}
 
 
 @app.post("/chat_stream")
@@ -632,18 +735,26 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
             print("[RAG] search error:", e, traceback.format_exc())
             contexts = []
 
-        prompt = build_prompt(body.message, contexts)
+        prompt, numbered_ctx, ooc = build_prompt_with_numbered_context(body.message, contexts)
         max_toks = body.num_predict or 512
 
         chunks: List[str] = []
+
         try:
+            # Show the emoji line FIRST if OOC
+            if ooc:
+                yield json.dumps({"type":"delta","text": f"{OOC_PREFIX}\n\n"}) + "\n"
+
             if body.provider == "groq":
                 if not _groq_client:
                     yield json.dumps({"type":"delta","text":"[Groq key missing]\n"}) + "\n"
                 else:
                     stream = _groq_client.chat.completions.create(
                         model=GROQ_MODEL_DEFAULT,
-                        messages=[{"role":"system","content":"You are a helpful, compassionate assistant."},{"role":"user","content":prompt}],
+                        messages=[
+                            {"role":"system","content":"You are a helpful, compassionate assistant."},
+                            {"role":"user","content":prompt}
+                        ],
                         max_tokens=max_toks, temperature=0.2, stream=True,
                     )
                     for chunk in stream:
@@ -662,8 +773,10 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
                     r.raise_for_status()
                     for line in r.iter_lines(decode_unicode=True):
                         if not line: continue
-                        try: ev = json.loads(line)
-                        except Exception: continue
+                        try:
+                            ev = json.loads(line)
+                        except Exception:
+                            continue
                         d = ev.get("response")
                         if d:
                             chunks.append(d)
@@ -671,8 +784,13 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
         except requests.exceptions.Timeout:
             yield json.dumps({"type":"delta","text":"[Provider timed out]\n"}) + "\n"
         finally:
-            final_text = "".join(chunks)
-            final_text_with_marker = append_sources_marker(final_text, contexts)
+            body_text = "".join(chunks).strip()
+            final_text = body_text
+            # If model ignored instruction, ensure the first line is present
+            if ooc and not final_text.startswith(OOC_PREFIX):
+                final_text = f"{OOC_PREFIX}\n\n{final_text}"
+
+            final_text_with_marker = append_cited_sources_marker(final_text, numbered_ctx)
 
             # Create conversation only now (first message), if missing
             conv_id = body.session_id
@@ -689,6 +807,7 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
             except Exception as e:
                 print("[DB] save failed (stream):", e, traceback.format_exc())
 
+            # Send any trailing text (e.g., sources marker that wasn't streamed)
             yield json.dumps({"type":"delta","text": final_text_with_marker[len(final_text):]}) + "\n"
             yield json.dumps({"type":"done"}) + "\n"
 
