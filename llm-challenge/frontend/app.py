@@ -707,6 +707,8 @@ def render_sidebar():
                 if st.button("📊 Your Dashboard", key="btn_user_dashboard", use_container_width=True):
                         st.session_state.view = "dashboard"
                         st.rerun()
+
+                # Start Questionnaire button
                 if st.button("▶ Start Questionnaire", key="btn_start_questionnaire", use_container_width=True):
                         r = api_post("/questionnaire/start")
                         if r is not None and r.status_code == 200:
@@ -1072,7 +1074,7 @@ if (not st.session_state.is_admin) and st.session_state.q_session_id and st.sess
                         st.markdown("**Tips**")
                         for t in tips: st.markdown(f"- {t}")
                 st.session_state.q_session_id = None
-                st.session_state.session_id = None   # optional: also close that chat
+                # st.session_state.session_id = None   # optional: also close that chat
                 st.rerun()
             else:
                 with st.chat_message("assistant"):
