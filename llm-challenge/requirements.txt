@@ -13,3 +13,6 @@ bcrypt==3.2.2
 streamlit
 requests
 qdrant_client
+psycopg2-binary
+pydantic[email]
+sentence-transformers

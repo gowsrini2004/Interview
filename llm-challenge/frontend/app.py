@@ -183,7 +183,7 @@ def render_meditation_page():
 
         # project root = go up from frontend/
         BASE_DIR = Path(__file__).resolve().parent.parent
-        SOURCES_DIR = BASE_DIR / "sources"
+        SOURCES_DIR = BASE_DIR / "frontend/sources"
 
         # map display names to file paths
         sound_map = {
