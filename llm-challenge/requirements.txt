@@ -10,3 +10,6 @@ python-multipart
 groq
 psycopg2-binary
 bcrypt==3.2.2
+streamlit
+requests
+qdrant_client
