@@ -14,8 +14,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc, func
 
 try:
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore
+    from apscheduler.triggers.cron import CronTrigger # type: ignore
 except ImportError:
     AsyncIOScheduler = None
     CronTrigger = None

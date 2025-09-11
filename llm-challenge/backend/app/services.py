@@ -25,6 +25,8 @@ from . import config, models
 _qdrant: Optional[QdrantClient] = None
 _embedder: Optional[SentenceTransformer] = None
 _groq_client: Optional[Groq] = Groq(api_key=config.GROQ_API_KEY) if config.GROQ_API_KEY else None
+SOURCES_MARKER_PREFIX = "<!--SOURCES_JSON:"
+SOURCES_MARKER_SUFFIX = "-->"
 
 
 # ---------------- RAG (Vector DB) Service ----------------

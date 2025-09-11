@@ -40,5 +40,3 @@ ENABLE_EMAIL_SCHEDULER = os.getenv("ENABLE_EMAIL_SCHEDULER", "1") == "1"
 MIN_QUESTIONS = 7
 CONTINUE_STEP = 3
 OOC_PREFIX = "🌐 I couldn’t find context in your uploaded sources — this answer is drawn from general knowledge!!"
-SOURCES_MARKER_PREFIX = "<!--SOURCES_JSON:"
-SOURCES_MARKER_SUFFIX = "-->"
