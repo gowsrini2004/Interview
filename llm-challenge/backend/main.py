@@ -12,8 +12,8 @@ from zoneinfo import ZoneInfo
 import ssl
 from email.utils import parseaddr, formataddr
 try:
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler # type: ignore
-    from apscheduler.triggers.cron import CronTrigger# type: ignore
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
 except Exception:
     AsyncIOScheduler = None
     CronTrigger = None
@@ -28,16 +28,16 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field, AnyHttpUrl
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-from passlib.context import CryptContext# type: ignore
+from passlib.context import CryptContext
 import jwt
 import requests
 import traceback
 
 
 # RAG libs
-from qdrant_client import QdrantClient# type: ignore
-from qdrant_client.http import models as qmodels# type: ignore
-from sentence_transformers import SentenceTransformer# type: ignore
+from qdrant_client import QdrantClient
+from qdrant_client.http import models as qmodels
+from sentence_transformers import SentenceTransformer
 
 # Groq SDK
 from groq import Groq
@@ -106,6 +106,14 @@ class Video(Base):
     added_by = Column(String(255), default="admin")    # 'admin' for now
     access = Column(String(32), default="all")         # 'all' | 'users' | 'counsellor' | 'admin'
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+class CounsellorProfile(Base):
+    __tablename__ = "counsellor_profiles"
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    experience_years = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 class User(Base):
     __tablename__ = "users"
@@ -113,6 +121,7 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    is_counsellor = Column(Integer, default=0)
 
 
 class Conversation(Base):
@@ -772,6 +781,18 @@ class VideoCreate(BaseModel):
     description: Optional[str] = None
     tags: Optional[List[str]] = None
     is_public: bool = True
+    
+class CounsellorUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    experience_years: Optional[int] = None
+
+    
+class CounsellorCreate(BaseModel):
+    user_id: int
+    name: str
+    description: Optional[str] = None
+    experience_years: int = 0
 
 class VideoOut(BaseModel):
     id: str
@@ -871,6 +892,7 @@ def health(user=Depends(get_current_user)):
             "email": user.email if not is_admin_principal(user) else "admin",
             "username": "admin" if is_admin_principal(user) else username_from_email(user.email),
             "is_admin": is_admin_principal(user),
+            "is_counsellor": bool(getattr(user, "is_counsellor", 0)),
         },
         "provider_defaults": {"mistral": OLLAMA_MODEL, "groq": GROQ_MODEL_DEFAULT if GROQ_API_KEY else None},
     }
@@ -885,14 +907,26 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     user = User(email=payload.email, password_hash=hash_password(payload.password))
     db.add(user); db.commit(); db.refresh(user)
     token = create_access_token(user.email)
-    return {"access_token": token, "token_type": "bearer", "is_admin": False}
+    return {"access_token": token, "token_type": "bearer", "is_admin": False, "is_counsellor": bool(user.is_counsellor)}
 
 @app.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
     # Hardcoded admin login
     if payload.identifier == "admin" and payload.password == "admin":
         token = create_access_token("admin")
-        return {"access_token": token, "token_type": "bearer", "is_admin": True}
+        return {"access_token": token, "token_type": "bearer", "is_admin": True, "is_counsellor": False}
+
+    # Normal user flow
+    user = db.query(User).filter(User.email == payload.identifier).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email/username or password")
+    token = create_access_token(user.email)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "is_admin": False,
+        "is_counsellor": bool(getattr(user, "is_counsellor", False)),
+    }
 
     # Normal user flow
     user = db.query(User).filter(User.email == payload.identifier).first()
@@ -947,8 +981,8 @@ def update_session_title(session_id: str, payload: UpdateTitleIn, user=Depends(g
 # ---------------- Ingest ----------------
 @app.post("/ingest")
 def ingest(file: UploadFile = File(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
-    if is_admin_principal(user):
-        raise HTTPException(status_code=403, detail="Admin cannot ingest documents.")
+    # if is_admin_principal(user):
+    #     raise HTTPException(status_code=403, detail="Admin cannot ingest documents.")
     if not file.filename.lower().endswith(".txt"):
         raise HTTPException(status_code=400, detail="Only .txt supported.")
     raw = file.file.read().decode("utf-8", errors="ignore")
@@ -1073,8 +1107,8 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
             body_text = "".join(chunks).strip()
             final_text = body_text
             # If model ignored instruction, ensure the first line is present
-            if ooc and not final_text.startswith(OOC_PREFIX):
-                final_text = f"{OOC_PREFIX}\n\n{final_text}"
+            # if ooc and not final_text.startswith(OOC_PREFIX):
+            #     final_text = f"{OOC_PREFIX}\n\n{final_text}"
 
             final_text_with_marker = append_cited_sources_marker(final_text, numbered_ctx)
 
@@ -1526,7 +1560,14 @@ def admin_list_users(db: Session = Depends(get_db), admin=Depends(require_admin)
         chat_cnt = db.query(Conversation).filter(Conversation.user_id == u.id).count()
         msg_cnt = db.query(Message).filter(Message.user_id == u.id).count()
         qa_cnt = db.query(QuestionnaireAttempt).filter(QuestionnaireAttempt.user_id == u.id).count()
-        active_qs = db.query(QuestionnaireSession).filter(QuestionnaireSession.user_id == u.id, QuestionnaireSession.is_active == 1).count()
+        active_qs = db.query(QuestionnaireSession).filter(
+            QuestionnaireSession.user_id == u.id,
+            QuestionnaireSession.is_active == 1
+        ).count()
+
+        # 🔹 Determine role
+        role = "counsellor" if getattr(u, "is_counsellor", 0) else "user"
+
         out.append({
             "id": u.id,
             "email": u.email,
@@ -1534,9 +1575,11 @@ def admin_list_users(db: Session = Depends(get_db), admin=Depends(require_admin)
             "conversations": chat_cnt,
             "messages": msg_cnt,
             "questionnaire_attempts": qa_cnt,
-            "active_questionnaires": active_qs
+            "active_questionnaires": active_qs,
+            "role": role
         })
     return out
+
 
 
 @app.delete("/admin/users/{user_id}")
@@ -1548,6 +1591,7 @@ def admin_delete_user(user_id: int, db: Session = Depends(get_db), admin=Depends
     db.query(Conversation).filter(Conversation.user_id == user_id).delete()
     db.query(QuestionnaireAttempt).filter(QuestionnaireAttempt.user_id == user_id).delete()
     db.query(QuestionnaireSession).filter(QuestionnaireSession.user_id == user_id).delete()
+    db.query(CounsellorProfile).filter(CounsellorProfile.user_id == user_id).delete()   # NEW
     db.query(User).filter(User.id == user_id).delete()
     db.commit()
     return {"ok": True}
@@ -1613,3 +1657,69 @@ def admin_clear_vector_db(db: Session = Depends(get_db), admin=Depends(require_a
     db.query(Document).delete()
     db.commit()
     return {"ok": True, "message": f"Vector collection '{COLLECTION}' deleted and document records cleared."}
+
+@app.get("/admin/counsellors")
+def admin_list_counsellors(db: Session = Depends(get_db), admin=Depends(require_admin)):
+    rows = (
+        db.query(User, CounsellorProfile)
+        .join(CounsellorProfile, CounsellorProfile.user_id == User.id)
+        .filter(User.is_counsellor == 1)
+        .all()
+    )
+    out = []
+    for u, c in rows:
+        out.append({
+            "id": u.id,
+            "email": u.email,
+            "name": c.name,
+            "description": c.description,
+            "experience_years": c.experience_years,
+            "created_at": u.created_at.isoformat(),
+        })
+    return out
+
+
+@app.post("/admin/counsellors/add")
+def admin_add_counsellor(body: CounsellorCreate, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    user = db.query(User).filter(User.id == body.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # mark as counsellor
+    user.is_counsellor = 1
+    profile = CounsellorProfile(
+        user_id=user.id,
+        name=body.name.strip(),
+        description=(body.description or "").strip(),
+        experience_years=body.experience_years
+    )
+    db.merge(profile)
+    db.commit()
+    return {"ok": True, "user_id": user.id, "is_counsellor": True}
+
+@app.get("/admin/users/non_counsellors")
+def admin_list_non_counsellors(db: Session = Depends(get_db), admin=Depends(require_admin)):
+    users = db.query(User).filter(User.is_counsellor == 0).all()
+    return [{"id": u.id, "email": u.email} for u in users]
+
+@app.patch("/admin/counsellors/{user_id}")
+def admin_update_counsellor(user_id: int, body: CounsellorUpdate, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    c = db.query(CounsellorProfile).filter(CounsellorProfile.user_id == user_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Counsellor not found")
+    if body.name is not None: c.name = body.name
+    if body.description is not None: c.description = body.description
+    if body.experience_years is not None: c.experience_years = body.experience_years
+    db.commit(); db.refresh(c)
+    return {"ok": True}
+
+@app.post("/admin/counsellors/{user_id}/demote")
+def admin_demote_counsellor(user_id: int, db: Session = Depends(get_db), admin=Depends(require_admin)):
+    u = db.query(User).filter(User.id == user_id).first()
+    if not u or not u.is_counsellor:
+        raise HTTPException(status_code=404, detail="Counsellor not found")
+    u.is_counsellor = 0
+    db.query(CounsellorProfile).filter(CounsellorProfile.user_id == user_id).delete()
+    db.commit()
+    return {"ok": True}
+

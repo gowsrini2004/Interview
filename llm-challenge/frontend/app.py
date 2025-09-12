@@ -20,6 +20,9 @@ def ensure_session_defaults():
     st.session_state.setdefault("sessions", [])
     st.session_state.setdefault("messages_cache", {})
 
+if "is_admin" not in st.session_state: st.session_state.is_admin = False
+if "is_counsellor" not in st.session_state: st.session_state.is_counsellor = False
+
 def is_admin() -> bool:
     return bool(st.session_state.get("is_admin", False))
 
@@ -571,15 +574,22 @@ def render_modal_panel():
 if not st.session_state.token:
     colL, colC, colR = st.columns([1,2,1])
     with colC:
-        st.markdown("<div style='text-align:center;'>", unsafe_allow_html=True)
-        st.write("### 🧠 Psych Support — AI Chat with RAG")
-        st.caption("A supportive mental wellness companion with document-aware answers and an adaptive questionnaire.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div style="text-align:center;">
+                <h3>🧠 Psych Support — AI Chat with RAG</h3>
+                <p style="color: gray; font-size: 14px;">
+                    A supportive mental wellness companion with document-aware answers and an adaptive questionnaire.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
         # 👇 wrap login/register in a form
+        mode = st.radio(" ", ["Login", "Register"], horizontal=True, label_visibility="collapsed")
         with st.form("auth_form", clear_on_submit=False):
-            mode = st.radio(" ", ["Login", "Register"], horizontal=True, label_visibility="collapsed")
-            identifier = st.text_input("Email or Username", placeholder="you@example.com (or admin)")
+            identifier = st.text_input("Email", placeholder="you@example.com")
             password = st.text_input("Password", type="password", placeholder="••••••••")
             submit = st.form_submit_button(mode, use_container_width=True)
 
@@ -594,11 +604,18 @@ if not st.session_state.token:
                 data = r.json()
                 st.session_state.token = data["access_token"]
                 st.session_state.is_admin = data.get("is_admin", False)
+                st.session_state.is_counsellor = data.get("is_counsellor", False)
                 h = api_get("/health")
                 if h is not None and h.status_code == 200:
                     me = h.json().get("me", {})
                     st.session_state.username = me.get("username", "there")
-                st.session_state.view = "admin" if st.session_state.is_admin else "chat"
+
+                if st.session_state.is_admin:
+                    st.session_state.view = "admin"
+                elif st.session_state.is_counsellor:
+                    st.session_state.view = "counsellor"
+                else:
+                    st.session_state.view = "chat"
                 st.rerun()
             else:
                 try:
@@ -629,6 +646,9 @@ def render_sidebar():
             st.subheader("Admin Console")
 
             # Utility (Admin)
+            if st.button("👨‍💼 Go to User Management", key="btn_admin_view"):
+                st.session_state.view = "admin"
+                st.rerun()
             with st.expander("⚙️ Utility", expanded=False):
                 st.caption("Role: **Admin**")
                 st.markdown("**Vector Store (Qdrant)**")
@@ -636,6 +656,17 @@ def render_sidebar():
                 if st.button("🧹 Clear Vector DB", key="btn_clear_vector_db"):
                     open_modal("vector_clear")
                     st.rerun()
+                st.markdown("**Upload Context (.txt)**")
+                up = st.file_uploader("Select a .txt file", type=["txt"], key="txt_uploader")
+                if up and st.button("Upload", key="btn_upload_txt"):
+                    r = api_post("/ingest", files={"file": up})
+                    if r is not None and r.status_code == 200:
+                        st.success(f"Ingested {r.json().get('ingested_chunks', 0)} chunks.")
+                    else:
+                        try:
+                            st.error(r.json().get("detail", "Upload failed"))
+                        except Exception:
+                            st.error("Server error during upload")
 
             # Email tool (Admin only)
             with st.expander("📧 Email Tool", expanded=False):
@@ -666,32 +697,38 @@ def render_sidebar():
                 if st.button("🎬 Open Library", key="btn_videos_admin", use_container_width=True):
                     st.session_state.view = "videos"
                     st.rerun()
+            
+            with st.expander("👥 Manage Counsellors", expanded=False):
+                if st.button("👨‍⚕️Manage Counsellors", key="btn_manage_counsellors"):
+                    st.session_state.view = "manage_counsellors"
+                    st.rerun()
 
             # NOTE: Questionnaire & Your Chats are intentionally hidden for Admin.
+        
+        # ------------------ COUNSELLOR VIEW ------------------
+        elif st.session_state.get("is_counsellor"):
+            st.subheader("Counsellor Console")
 
-        # ------------------ USER VIEW ------------------
-        else:
-            # Utility (User)
             with st.expander("⚙️ Utility", expanded=False):
-                st.caption("Role: **User**")
+                st.caption("Role: **Counsellor**")
 
                 st.markdown("**Model Provider**")
                 st.session_state.provider = st.selectbox(
                     "Choose provider",
                     ["groq", "mistral"],
                     index=0 if st.session_state.get("provider") == "groq" else 1,
-                    key="select_provider",
+                    key="select_provider_counsellor",
                 )
 
                 st.checkbox(
                     "Stream responses",
                     value=st.session_state.get("streaming", True),
-                    key="streaming"
+                    key="streaming_counsellor"
                 )
 
                 st.markdown("**Upload Context (.txt)**")
-                up = st.file_uploader("Select a .txt file", type=["txt"], key="txt_uploader")
-                if up and st.button("Upload", key="btn_upload_txt"):
+                up = st.file_uploader("Select a .txt file", type=["txt"], key="txt_uploader_counsellor")
+                if up and st.button("Upload", key="btn_upload_txt_counsellor"):
                     r = api_post("/ingest", files={"file": up})
                     if r is not None and r.status_code == 200:
                         st.success(f"Ingested {r.json().get('ingested_chunks', 0)} chunks.")
@@ -700,46 +737,7 @@ def render_sidebar():
                             st.error(r.json().get("detail", "Upload failed"))
                         except Exception:
                             st.error("Server error during upload")
-
-            # Questionnaire (User only)
-            with st.expander("📊 Questionnaire", expanded=False):
-                st.caption("Answer at least 10 adaptive questions. Then continue (+3) or get your score.")
-                if st.button("📊 Your Dashboard", key="btn_user_dashboard", use_container_width=True):
-                        st.session_state.view = "dashboard"
-                        st.rerun()
-
-                # Start Questionnaire button
-                if st.button("▶ Start Questionnaire", key="btn_start_questionnaire", use_container_width=True):
-                    r = api_post("/questionnaire/start")
-                    if r is not None and r.status_code == 200:
-                            data = r.json()
-                            st.session_state.q_session_id = data["session_id"]
-                            st.session_state.session_id = data["session_id"]
-                            st.session_state.view = "chat"
-                            st.rerun()
-                    else:
-                            st.error("Could not start questionnaire")
-
-            # Videos (User)
-            with st.expander("🎬 Videos", expanded=False):
-                if st.button("🎬 Open Library", key="btn_videos_user", use_container_width=True):
-                    st.session_state.view = "videos"
-                    st.rerun()
-                    
-            with st.sidebar:
-                with st.expander("🧘 Meditate", expanded=False):
-                    if st.button("🧘 Guided Meditation"):
-                        st.session_state.view = "meditation"; st.session_state.med_page = "guided"; st.rerun()
-                    if st.button("⛩ Meditation Room"):
-                        st.session_state.view = "meditation"; st.session_state.med_page = "room"; st.rerun()
-                        
-            with st.expander("ૐ Yoga", expanded=False):
-                if st.button("🧘Open Yoga Studio", key="sidebar_yoga"):
-                    st.session_state.view = "yoga"
-                    st.rerun()
-
-
-            # Your Chats (User only)
+            
             with st.expander("🤖 Your Chats", expanded=False):
                 # Quick actions
                 colA, colB = st.columns([1, 1])
@@ -834,7 +832,273 @@ def render_sidebar():
                                 st.rerun()
                         st.markdown("---")
 
+            with st.expander("🧘 Meditate", expanded=False):
+                    if st.button("🧘 Guided Meditation"):
+                        st.session_state.view = "meditation"; st.session_state.med_page = "guided"; st.rerun()
+                    if st.button("⛩ Meditation Room"):
+                        st.session_state.view = "meditation"; st.session_state.med_page = "room"; st.rerun()
+                        
+            with st.expander("ૐ Yoga", expanded=False):
+                if st.button("🧘Open Yoga Studio", key="sidebar_yoga"):
+                    st.session_state.view = "yoga"
+                    st.rerun()
+
+
+            # Your Chats (User only)
+
+
+        # ------------------ USER VIEW ------------------
+        else:
+            # Utility (User)
+            with st.expander("⚙️ Utility", expanded=False):
+                st.caption("Role: **User**")
+
+                st.markdown("**Model Provider**")
+                st.session_state.provider = st.selectbox(
+                    "Choose provider",
+                    ["groq", "mistral"],
+                    index=0 if st.session_state.get("provider") == "groq" else 1,
+                    key="select_provider",
+                )
+
+                st.checkbox(
+                    "Stream responses",
+                    value=st.session_state.get("streaming", True),
+                    key="streaming"
+                )
+            
+             # Your Chats (User only)
+            with st.expander("🤖 Your Chats", expanded=False):
+                # Quick actions
+                colA, colB = st.columns([1, 1])
+                with colA:
+                    if st.button("➕ New Chat", key="btn_new_chat", use_container_width=True):
+                        st.session_state.session_id = None
+                        st.session_state.view = "chat"
+                        st.rerun()
+                with colB:
+                    if st.button("🔄 Refresh", key="btn_refresh_chats", use_container_width=True):
+                        # clear cache on refresh
+                        st.session_state.pop("messages_cache", None)
+                        refresh_sessions()
+
+                # Ensure sessions are loaded
+                if not st.session_state.get("sessions"):
+                    refresh_sessions()
+
+                # Search
+                search_q = st.text_input(
+                    "Search chats",
+                    key="chat_search",
+                    placeholder="Search by title or message…",
+                )
+
+                row1 = st.container()
+                col1, col2 = row1.columns([4, 1])
+                with col1:
+                    search_in_messages = st.checkbox(
+                        "Search inside messages",
+                        key="chat_search_messages",
+                        value=False
+                    )
+
+                def _clear_chat_search():
+                    st.session_state.update({
+                        "chat_search": "",
+                        "chat_search_messages": False,
+                    })
+                    st.session_state.pop("messages_cache", None)
+
+                with col2:
+                    st.button("❌", key="chat_clear_btn", on_click=_clear_chat_search)
+
+                # --- Filter logic ---
+                sess_list = list(st.session_state.get("sessions", []))  # copy
+                q = (search_q or "").strip().lower()
+
+                # simple cache for session messages to avoid re-fetching repeatedly
+                if "messages_cache" not in st.session_state:
+                    st.session_state.messages_cache = {}
+
+                if q:
+                    if search_in_messages:
+                        matches = []
+                        for s in sess_list:
+                            title = (s.get("title") or "").lower()
+                            if q in title:
+                                matches.append(s)
+                                continue
+                            sid = s["id"]
+                            cache = st.session_state.messages_cache.get(sid)
+                            if cache is None:
+                                rmsgs = api_get(f"/sessions/{sid}/messages")
+                                cache = rmsgs.json() if (rmsgs is not None and rmsgs.status_code == 200) else []
+                                st.session_state.messages_cache[sid] = cache
+                            if any(q in (m.get("content", "").lower()) for m in cache):
+                                matches.append(s)
+                        sess_list = matches
+                    else:
+                        # title-only search
+                        sess_list = [s for s in sess_list if q in ((s.get("title") or "").lower())]
+
+                # --- Render results ---
+                if not sess_list:
+                    st.info("No chats matched your search.")
+                else:
+                    groups = defaultdict(list)
+                    for row in sess_list:
+                        d = human_time(row["created_at"])[:10]  # 'YYYY-MM-DD'
+                        groups[d].append(row)
+
+                    for day in sorted(groups.keys(), reverse=True):
+                        dt = datetime.strptime(day, "%Y-%m-%d")
+                        label = dt.strftime("%b %d %y")
+                        st.markdown(f"**{label}**")
+                        for row in groups[day]:
+                            btn_label = f"🗨️ {row['title'] or 'Chat'}"
+                            if st.button(btn_label, key=f"chat_{row['id']}"):
+                                st.session_state.view = "chat"
+                                st.session_state.session_id = row["id"]
+                                st.rerun()
+                        st.markdown("---")
+
+            # Questionnaire (User only)
+            with st.expander("📊 Questionnaire", expanded=False):
+                st.caption("Answer at least 10 adaptive questions. Then continue (+3) or get your score.")
+                if st.button("📊 Your Dashboard", key="btn_user_dashboard", use_container_width=True):
+                        st.session_state.view = "dashboard"
+                        st.rerun()
+
+                # Start Questionnaire button
+                if st.button("▶ Start Questionnaire", key="btn_start_questionnaire", use_container_width=True):
+                    r = api_post("/questionnaire/start")
+                    if r is not None and r.status_code == 200:
+                            data = r.json()
+                            st.session_state.q_session_id = data["session_id"]
+                            st.session_state.session_id = data["session_id"]
+                            st.session_state.view = "chat"
+                            st.rerun()
+                    else:
+                            st.error("Could not start questionnaire")
+
+            # Videos (User)
+            with st.expander("🎬 Videos", expanded=False):
+                if st.button("🎬 Open Library", key="btn_videos_user", use_container_width=True):
+                    st.session_state.view = "videos"
+                    st.rerun()
+                    
+            with st.sidebar:
+                with st.expander("🧘 Meditate", expanded=False):
+                    if st.button("🧘 Guided Meditation"):
+                        st.session_state.view = "meditation"; st.session_state.med_page = "guided"; st.rerun()
+                    if st.button("⛩ Meditation Room"):
+                        st.session_state.view = "meditation"; st.session_state.med_page = "room"; st.rerun()
+                        
+            with st.expander("ૐ Yoga", expanded=False):
+                if st.button("🧘Open Yoga Studio", key="sidebar_yoga"):
+                    st.session_state.view = "yoga"
+                    st.rerun()
+
+
+           
+
 render_sidebar()
+
+if st.session_state.view == "manage_counsellors":
+    st.header("👥 Manage Counsellors")
+
+    if st.button("⬅ Back to Users"):
+        st.session_state.view = "admin"
+        st.rerun()
+
+    # ---- Add Counsellor Expander ----
+    with st.expander("➕ Add Counsellor", expanded=True):
+        r = api_get("/admin/users/non_counsellors")
+        users = r.json() if (r is not None and r.status_code == 200) else []
+
+        if not users:
+            st.info("No users available to promote.")
+        else:
+            u_map = {f"{u['email']} (ID: {u['id']})": u["id"] for u in users}
+
+            # --- Form start ---
+            with st.form("add_counsellor_form", clear_on_submit=True):
+                choice = st.selectbox("Select user", list(u_map.keys()), key="AddCounsellor_choice")
+                name = st.text_input("Counsellor Name", key="AddCounsellor_name")
+                desc = st.text_area("Description", height=100, key="AddCounsellor_desc")
+                exp = st.number_input("Years of Experience", min_value=0, step=1, key="AddCounsellor_exp")
+
+                submitted = st.form_submit_button("Add Counsellor")
+                if submitted:
+                    payload = {
+                        "user_id": u_map.get(choice),
+                        "name": name,
+                        "description": desc,
+                        "experience_years": exp,
+                    }
+                    resp = api_post("/admin/counsellors/add", json=payload)
+                    if resp is not None and resp.status_code in (200, 201):
+                        st.success("User promoted to counsellor.")
+                        st.rerun()
+                    else:
+                        try:
+                            st.error(resp.json().get("detail", "Failed to add counsellor"))
+                        except Exception:
+                            st.error("Failed to add counsellor")
+        # --- Form end ---
+
+
+    # ---- Counsellors List ----
+    rc = api_get("/admin/counsellors")
+    counsellors = rc.json() if (rc is not None and rc.status_code == 200) else []
+    if not counsellors:
+        st.info("No counsellors yet.")
+    else:
+        h1, h2, h3, h4, h5 = st.columns([3, 3, 2, 2, 2])
+        with h1: st.markdown("**Name**")
+        with h2: st.markdown("**Email**")
+        with h3: st.markdown("**Edit**")
+        with h4: st.markdown("**Demote**")
+        with h5: st.markdown("**Delete**")
+
+        for c in counsellors:
+            r1, r2, r3, r4, r5 = st.columns([3, 3, 2, 2, 2])
+            with r1:
+                st.markdown(f"**{c['name']}** - ({c['experience_years']} yrs exp)")
+                st.markdown(f"_{c['description']}_")
+            with r2:
+                st.markdown(c["email"])
+            with r3:
+                if st.button("✏️ Edit", key=f"edit_c_{c['id']}"):
+                    with st.form(f"edit_c_form_{c['id']}", clear_on_submit=True):
+                        name = st.text_input("Name", value=c["name"])
+                        desc = st.text_area("Description", value=c["description"])
+                        exp = st.number_input("Experience (yrs)", min_value=0, value=c["experience_years"])
+                        submitted = st.form_submit_button("Save")
+                        if submitted:
+                            r = api_patch(f"/admin/counsellors/{c['id']}", json={
+                                "name": name, "description": desc, "experience": exp
+                            })
+                            if r is not None and r.status_code == 200:
+                                st.success("Updated.")
+                                st.rerun()
+                            else:
+                                st.error("Failed to update")
+            with r4:
+                if st.button("⬇ Demote", key=f"demote_c_{c['id']}"):
+                    r = api_post(f"/admin/counsellors/{c['id']}/demote")
+                    if r is not None and r.status_code == 200:
+                        st.success("Demoted to user.")
+                        st.rerun()
+            with r5:
+                if st.button("🗑 Delete", key=f"del_c_{c['id']}"):
+                    r = api_delete(f"/admin/users/{c['id']}")
+                    if r is not None and r.status_code in (200, 204):
+                        st.success("User deleted.")
+                        st.rerun()
+    st.stop()
+    
+
 
 if st.session_state.view == "admin":
     st.header("🛠 Admin Panel")
@@ -850,32 +1114,47 @@ if st.session_state.view == "admin":
     filtered = [u for u in users if (not q or q.lower() in u["email"].lower())]
 
     # Table header
-    h1, h2, h3, h4, h5, h6 = st.columns([5,2,2,2,3,1])
+    h1, h2, h3, h4, h5, h6, h7 = st.columns([4,2,2,2,2,3,1])
     with h1: st.markdown("**Email**")
-    with h2: st.markdown("**Conversations**")
-    with h3: st.markdown("**Questionnaires**")
-    with h4: st.markdown("**Clear Chats**")
-    with h5: st.markdown("**Clear Questionnaire**")
-    with h6: st.markdown("** **")
+    with h2: st.markdown("**Role**")
+    with h3: st.markdown("**Conversations**")
+    with h4: st.markdown("**Questionnaires**")
+    with h5: st.markdown("**Clear Chats**")
+    with h6: st.markdown("**Clear Questionnaire**")
+    with h7: st.markdown("**More**")
 
     # Rows
+    # Rows (show Role; hide Clear Questionnaire for counsellors)
     for u in filtered:
-        c1, c2, c3, c4, c5, c6 = st.columns([5,2,2,2,3,1])
+        c1, c2, c3, c4, c5, c6, c7 = st.columns([5,2,2,2,3,2,1])
         created = human_time(u["created_at"])
         email_html = f"<span title='Created: {created}'>{u['email']}</span>"
+
         with c1: st.markdown(email_html, unsafe_allow_html=True)
-        with c2: st.markdown(str(u["conversations"]))
-        with c3: st.markdown(str(u["questionnaire_attempts"]))
-        with c4:
-            if st.button("Clear", key=f"cc_{u['id']}"):
-                open_modal("clear_chats", {"user_id": u["id"], "email": u["email"]}); st.rerun()
+        with c2: st.markdown(u.get("role", "user"))   # new role column
+        with c3: st.markdown(str(u["conversations"]))
+        with c4: st.markdown(str(u["questionnaire_attempts"]))
+
+        # Hide questionnaire clear button for counsellors
         with c5:
-            if st.button("Clear", key=f"cq_{u['id']}"):
-                open_modal("clear_questionnaires", {"user_id": u["id"], "email": u["email"]}); st.rerun()
+            if st.button("Clear", key=f"cc_{u['id']}"):
+                open_modal("clear_chats", {"user_id": u["id"], "email": u["email"]})
+                st.rerun()
+
+        # c6 = Clear Questionnaire
         with c6:
+            if u.get("role") != "counsellor":
+                if st.button("Clear", key=f"cq_{u['id']}"):
+                    open_modal("clear_questionnaires", {"user_id": u["id"], "email": u["email"]})
+                    st.rerun()
+            else:
+                st.caption("NA")
+
+        with c7:
             if st.button("⋯", key=f"menu_{u['id']}"):
                 st.session_state.actions_user = {"id": u["id"], "email": u["email"]}
-                open_modal("user_actions", {"user_id": u["id"], "email": u["email"]}); st.rerun()
+                open_modal("user_actions", {"user_id": u["id"], "email": u["email"]})
+                st.rerun()
 
     
     st.stop()
@@ -934,7 +1213,7 @@ if st.session_state.view == "videos":
                     except Exception: st.error("Server error while adding video")
 
     # Search
-    if st.button("⬅ Back to Dashboard", key="med_back_v2"):
+    if st.button("⬅ Back to Users", key="med_back_v2"):
         st.session_state.view = "chat"
         st.rerun()
     q = st.text_input("Search videos (title / description / tags)", key="video_search", placeholder="e.g., anxiety, breathing")
