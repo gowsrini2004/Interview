@@ -10,6 +10,7 @@ from collections import defaultdict
 from zoneinfo import ZoneInfo
 from pathlib import Path
 import base64
+
 # ---------- sensible defaults ----------
 def ensure_session_defaults():
     st.session_state.setdefault("username", "")
@@ -696,18 +697,32 @@ def render_sidebar():
                 if st.button("🧹 Clear Vector DB", key="btn_clear_vector_db"):
                     open_modal("vector_clear")
                     st.rerun()
-                st.markdown("**Upload Context (.txt)**")
-                up = st.file_uploader("Select a .txt file", type=["txt"], key="txt_uploader")
+                st.markdown("**📂 Upload Context (txt/pdf/docx/xlsx/csv)**")
+
+                # Keep a dynamic key so uploader resets after success
+                if "upload_key" not in st.session_state:
+                    st.session_state.upload_key = 0
+
+                up = st.file_uploader(
+                    "Select a file",
+                    type=["txt", "pdf", "docx", "xlsx", "csv"],
+                    key=f"txt_uploader_{st.session_state.upload_key}"
+                )
+
                 if up and st.button("Upload", key="btn_upload_txt"):
                     r = api_post("/ingest", files={"file": up})
                     if r is not None and r.status_code == 200:
-                        st.success(f"Ingested {r.json().get('ingested_chunks', 0)} chunks.")
+                        data = r.json()
+                        chunks = data.get("ingested_chunks", 0)
+                        st.markdown(f"✅ Ingested {chunks} chunks from {up.name}")
+                        # 🔥 Reset uploader so file disappears after success
+                        st.session_state.upload_key += 1
+                        st.rerun()
                     else:
                         try:
                             st.error(r.json().get("detail", "Upload failed"))
                         except Exception:
                             st.error("Server error during upload")
-
             # Email tool (Admin only)
             with st.expander("📧 Email Tool", expanded=False):
                 st.caption("Visible only to Admins")
@@ -767,14 +782,29 @@ def render_sidebar():
                     key="streaming_counsellor"
                 )
 
-                st.markdown("**Upload Context (.txt)**")
-                up = st.file_uploader("Select a .txt file", type=["txt"], key="txt_uploader_counsellor")
-                if up and st.button("Upload", key="btn_upload_txt_counsellor"):
+                st.markdown("**📂 Upload Context (txt/pdf/docx/xlsx/csv)**")
+
+                # Keep a dynamic key so uploader resets after success
+                if "upload_key" not in st.session_state:
+                    st.session_state.upload_key = 0
+
+                up = st.file_uploader(
+                    "Select a file",
+                    type=["txt", "pdf", "docx", "xlsx", "csv"],
+                    key=f"txt_uploader_{st.session_state.upload_key}"
+                )
+
+                if up and st.button("Upload", key="btn_upload_txt"):
                     r = api_post("/ingest", files={"file": up})
                     if r is not None and r.status_code == 200:
-                        st.success(f"Ingested {r.json().get('ingested_chunks', 0)} chunks.")
+                        data = r.json()
+                        chunks = data.get("ingested_chunks", 0)
+                        st.markdown(f"✅ Ingested {chunks} chunks from {up.name}")
+                        # 🔥 Reset uploader so file disappears after success
+                        st.session_state.upload_key += 1
+                        st.rerun()
                     else:
-                        try:
+                        try:    
                             st.error(r.json().get("detail", "Upload failed"))
                         except Exception:
                             st.error("Server error during upload")
@@ -1508,7 +1538,7 @@ if st.session_state.view == "counsellor_videos_all":
                     "is_public": True,
                     "target_user_id": None
                 }
-                print(payload)
+                # print(payload)
                 resp = api_post("/counsellor/videos", json=payload)
                 if resp and resp.status_code in (200, 201, 204):
                     st.success("Video added for all users.")
@@ -1584,7 +1614,7 @@ if st.session_state.view == "counsellor_videos_users":
                     "is_public": False,
                     "target_user_id": str(user_id)   # must be int, not str 
                 }
-                print(user_id, type(user_id))
+                # print(user_id, type(user_id))
                 resp = api_post("/counsellor/videos", json=payload)
                 if resp and resp.status_code in (200, 201):
                     st.success(f"Video added for {choice}")

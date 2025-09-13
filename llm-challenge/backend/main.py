@@ -17,6 +17,9 @@ try:
 except Exception:
     AsyncIOScheduler = None
     CronTrigger = None
+from PyPDF2 import PdfReader
+import docx
+import pandas as pd
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -30,6 +33,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, F
 from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship, joinedload
 from passlib.context import CryptContext
 import jwt
+
 import requests
 import traceback
 
@@ -777,6 +781,26 @@ def call_ollama(prompt: str, num_predict: int = 512) -> str:
         print("[LLM] Ollama call failed:", e)
         return "Local model is not available right now."
 
+def extract_text_from_file(file: UploadFile) -> str:
+    name = file.filename.lower()
+    if name.endswith(".txt"):
+        return file.file.read().decode("utf-8", errors="ignore")
+    elif name.endswith(".pdf"):
+        from PyPDF2 import PdfReader
+        pdf = PdfReader(file.file)
+        return "\n".join([p.extract_text() or "" for p in pdf.pages])
+    elif name.endswith(".docx"):
+        import docx
+        doc = docx.Document(file.file)
+        return "\n".join([p.text for p in doc.paragraphs])
+    elif name.endswith((".xls", ".xlsx")):
+        df = pd.read_excel(file.file)
+        return "\n".join(df.astype(str).fillna("").apply(lambda r: " ".join(r), axis=1))
+    elif name.endswith(".csv"):
+        df = pd.read_csv(file.file)
+        return "\n".join(df.astype(str).fillna("").apply(lambda r: " ".join(r), axis=1))
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type")
 
 def call_groq(prompt: str, num_predict: int = 512) -> str:
     if not _groq_client:
@@ -1052,19 +1076,16 @@ def update_session_title(session_id: str, payload: UpdateTitleIn, user=Depends(g
 # ---------------- Ingest ----------------
 @app.post("/ingest")
 def ingest(file: UploadFile = File(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
-    # if is_admin_principal(user):
-    #     raise HTTPException(status_code=403, detail="Admin cannot ingest documents.")
-    if not file.filename.lower().endswith(".txt"):
-        raise HTTPException(status_code=400, detail="Only .txt supported.")
-    raw = file.file.read().decode("utf-8", errors="ignore")
+    raw = extract_text_from_file(file)
     chunks = [raw[i:i+800].strip() for i in range(0, len(raw), 800) if raw[i:i+800].strip()]
     payloads = [{
         "id": str(uuid.uuid4()),
         "text": c,
         "meta": {"uploader": user.email, "filename": file.filename},
-        "user_id": user.id,  # ✅ tag vectors with user_id
+        "user_id": user.id,
     } for c in chunks]
-    db.add(Document(id=str(uuid.uuid4()), uploader=user.email, filename=file.filename)); db.commit()
+    db.add(Document(id=str(uuid.uuid4()), uploader=user.email, filename=file.filename))
+    db.commit()
     count = upsert_documents_to_qdrant(payloads)
     return {"ok": True, "ingested_chunks": count}
 
