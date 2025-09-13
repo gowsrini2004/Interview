@@ -26,7 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field, AnyHttpUrl
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc, Boolean
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from passlib.context import CryptContext
 import jwt
@@ -93,6 +93,23 @@ Base = declarative_base()
 
 
 # --- models ---
+class Appointment(Base):
+    __tablename__ = "appointments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    counsellor_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=False)
+    duration_minutes = Column(Integer, nullable=False)
+    status = Column(String, default="pending")  # pending / accepted / rejected / closed
+
+    # ✅ New fields you must add
+    report = Column(Text, nullable=True)
+    meeting_link = Column(String(512), nullable=True)
+    reminder_24_sent = Column(Boolean, default=False)
+    reminder_12_sent = Column(Boolean, default=False)
+
 class Video(Base):
     __tablename__ = "videos"
     id = Column(String(36), primary_key=True, index=True)
@@ -795,6 +812,11 @@ app.add_middleware(
 
 
 # ---------------- Schemas ----------------
+class AppointmentCreate(BaseModel):
+    counsellor_id: int
+    start_time: datetime
+    duration_minutes: int
+    
 class AccessRequestIn(BaseModel):
     user_id: int
     request_type: Literal["chats", "dashboard"]
@@ -2106,17 +2128,91 @@ def request_access(
     return {"ok": True, "msg": "Request sent", "request_id": req.id}
 
 
-# def send_email(to_email: str, subject: str, body: str):
-#     """Send a simple email via MailHog SMTP"""
-#     msg = MIMEText(body, "plain")
-#     msg["From"] = "noreply@Psych.com"
-#     msg["To"] = to_email
-#     msg["Subject"] = subject
 
-#     try:
-#         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:  # "localhost" if not in docker
-#             server.sendmail(msg["From"], [to_email], msg.as_string())
-#         return True
-#     except Exception as e:
-#         print("Email send failed:", e)
-#         return False
+@app.post("/appointments")
+def create_appointment(ap: AppointmentCreate, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.is_counsellor:
+        raise HTTPException(403, "Counsellor cannot create user appointment request")
+
+    start = ap.start_time
+    if start <= datetime.utcnow():
+        raise HTTPException(400, "Cannot book an appointment in the past")
+
+    end = start + timedelta(minutes=ap.duration_minutes)
+
+    # Check overlap for both user and counsellor
+    overlap = db.query(Appointment).filter(
+        Appointment.status.in_(["pending","accepted"]),
+        or_(
+            and_(Appointment.user_id == user.id, Appointment.start_time < end, Appointment.end_time > start),
+            and_(Appointment.counsellor_id == ap.counsellor_id, Appointment.start_time < end, Appointment.end_time > start)
+        )
+    ).first()
+    if overlap:
+        raise HTTPException(400, "Overlapping appointment exists")
+
+    new_ap = Appointment(
+        user_id=user.id,
+        counsellor_id=ap.counsellor_id,
+        start_time=start,
+        end_time=end,
+        duration_minutes=ap.duration_minutes,
+        status="pending"
+    )
+    db.add(new_ap)
+    db.commit()
+    db.refresh(new_ap)
+
+    # ✅ Email to counsellor
+    counsellor = db.query(User).filter(User.id==ap.counsellor_id).first()
+    if counsellor:
+        send_email(
+            counsellor.email,
+            "New Appointment Request",
+            f"Hello,\n\nYou have a new appointment request from {user.email}.\n\n"
+            f"Date & Time: {start}\nDuration: {ap.duration_minutes} minutes\n\n"
+            "Please log in to review."
+        )
+
+    return {"message": "Appointment requested", "appointment_id": new_ap.id}
+
+@app.delete("/appointments/{ap_id}")
+def delete_appointment(ap_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    ap = db.query(Appointment).get(ap_id)
+    if not ap:
+        raise HTTPException(404, "Not found")
+    if ap.user_id != user.id and ap.counsellor_id != user.id:
+        raise HTTPException(403, "Not allowed")
+
+    u = db.query(User).get(ap.user_id)
+    c = db.query(User).get(ap.counsellor_id)
+
+    db.delete(ap)
+    db.commit()
+
+    # ✅ Send deletion emails
+    if u:
+        send_email(u.email, "Appointment Cancelled", f"Your appointment on {ap.start_time} was cancelled.")
+    if c:
+        send_email(c.email, "Appointment Cancelled", f"Appointment with {u.email if u else 'user'} on {ap.start_time} was cancelled.")
+
+    return {"message": "Deleted"}
+
+@app.get("/appointments/my")
+def my_appointments(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    q = db.query(Appointment).filter(Appointment.user_id == user.id).order_by(Appointment.start_time.desc()).all()
+    return [
+        {
+            "id": ap.id,
+            "user_id": ap.user_id,
+            "counsellor_id": ap.counsellor_id,
+            "start_time": ap.start_time.isoformat(),
+            "end_time": ap.end_time.isoformat(),
+            "duration_minutes": ap.duration_minutes,
+            "status": ap.status,
+            "report": ap.report,  # Include the report field
+            "meeting_link": ap.meeting_link,
+        }
+        for ap in q
+    ]
+

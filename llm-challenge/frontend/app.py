@@ -416,8 +416,18 @@ def api_user_post_access(json_body):
 def api_user_get_access():
     return api_get("/user/access")
 
+def api_create_appointment(json_body):
+    return api_post("/appointments", json=json_body)
+
 def api_user_patch_access(access_id, json_body):
     return api_patch(f"/user/access/{access_id}", json=json_body)
+
+def api_my_appointments():
+    return api_get("/appointments/my")
+
+def api_delete_appointment(ap_id):
+    return api_delete(f"/appointments/{ap_id}")
+
 
 def api_user_delete_access(access_id):
     return api_delete(f"/user/access/{access_id}")
@@ -1016,6 +1026,10 @@ def render_sidebar():
                         st.markdown("---")
 
             # Questionnaire (User only)
+            with st.expander("🩺 Consultation", expanded=False):
+                if st.button("📅 My Appointments"):
+                    st.session_state.view = "appointments"
+                    st.rerun()
             with st.expander("📊 Questionnaire", expanded=False):
                 st.caption("Answer at least 10 adaptive questions. Then continue (+3) or get your score.")
                 if st.button("📊 Your Dashboard", key="btn_user_dashboard", use_container_width=True):
@@ -1096,6 +1110,155 @@ if st.session_state.view == "user_videos":
                 st.caption(f"Added by: {v.get('added_by', 'unknown')}")
     st.stop()
 
+if st.session_state.view == "appointments":
+    st.title("📅 My Appointments")
+
+    # --- Add Appointment ---
+    with st.expander("➕ Add Appointment"):
+        rc = api_get("/public/counsellors")
+        counsellors = rc.json() if rc and rc.status_code == 200 else []
+        counsellor_map = {str(c["id"]): c["email"] for c in counsellors}
+
+        sel = st.selectbox("Select Counsellor", options=list(counsellor_map.keys()),
+                           format_func=lambda x: counsellor_map.get(x, ""))
+
+        # 👇 Persist date selection
+        if "appointment_date" not in st.session_state:
+            st.session_state.appointment_date = datetime.now().date()
+        date_sel = st.date_input("Date", key="appointment_date")
+
+        # 👇 Persist time selection
+        if "appointment_time" not in st.session_state:
+            st.session_state.appointment_time = datetime.now().time()
+        time_sel = st.time_input("Time", key="appointment_time")
+
+        # 👇 Persist duration
+        if "appointment_duration" not in st.session_state:
+            st.session_state.appointment_duration = 30
+        duration = st.number_input("Duration (minutes)", min_value=15, step=15,
+                                   key="appointment_duration")
+
+        if st.button("Book Appointment", key="book_appt_btn"):
+            start = datetime.combine(date_sel, time_sel)
+            if start <= datetime.now():
+                st.error("⛔ You cannot book an appointment in the past.")
+            else:
+                body = {"counsellor_id": int(sel), "start_time": start.isoformat(),
+                        "duration_minutes": duration}
+                r = api_create_appointment(body)
+                if r and r.status_code == 200:
+                    st.success(r.json().get("message", "Appointment created"))
+                    st.rerun()
+                else:
+                    try:
+                        st.error(r.json().get("detail", "Failed to create appointment"))
+                    except:
+                        st.error("Failed to create appointment")
+
+    # --- Tabs for appointments ---
+    r = api_my_appointments()
+    appts = r.json() if r and r.status_code == 200 else []
+
+    tab_today, tab_future, tab_closed = st.tabs(["Today Appointments", "Future Appointments", "Closed Appointments"])
+
+    today = datetime.now().date()
+    now = datetime.now()
+
+    with tab_today:
+        st.subheader("Today's Appointments")
+        todays = [
+            a for a in appts
+            if datetime.fromisoformat(a["start_time"]).date() == today and a["status"] != "closed"
+        ]
+        if not todays:
+            st.info("No appointments today.")
+        else:
+            # Table header
+            h2, h3, h5, h6, h7,h9 = st.columns([2, 2, 2, 2, 3,1])
+            h2.write("Counsellor")
+            h3.write("Start")
+            h5.write("Duration")
+            h6.write("Status")
+            h7.write("Meeting Link")
+            h9.write("Action")
+
+            for a in todays:
+                c_email = counsellor_map.get(str(a["counsellor_id"]), f"Counsellor {a['counsellor_id']}")
+                c2, c3, c5, c6, c7,c9 = st.columns([2, 2,2, 2, 3,1])
+                c2.write(c_email)
+                c3.write(datetime.fromisoformat(a["start_time"]).strftime("%Y-%m-%d %H:%M"))
+                c5.write(f"{a['duration_minutes']} min")
+                c6.write(a["status"].capitalize())
+                c7.write(a.get("meeting_link") or "—")
+                if c9.button("❌", key=f"del_today_{a['id']}"):
+                    resp = api_delete_appointment(a["id"])
+                    if resp and resp.status_code == 200:
+                        st.success("Appointment deleted.")
+                    else:
+                        st.error("Delete failed.")
+                    st.query_params(refresh=str(datetime.now().timestamp()))
+
+        with tab_future:
+            st.subheader("Future Appointments")
+            future = [
+                a for a in appts
+                if datetime.fromisoformat(a["start_time"]) > now and a["status"] != "closed"
+            ]
+            if not future:
+                st.info("No future appointments.")
+            else:
+                # Table header
+                h2, h3,h5, h6, h7,h9 = st.columns([2, 2, 2, 2, 3,1])
+                h2.write("Counsellor")
+                h3.write("Start")
+                h5.write("Duration")
+                h6.write("Status")
+                h7.write("Meeting Link")
+                h9.write("Action")
+
+                for a in future:
+                    c_email = counsellor_map.get(str(a["counsellor_id"]), f"Counsellor {a['counsellor_id']}")
+                    c2, c3, c5, c6, c7,c9 = st.columns([2, 2, 2, 2, 3,1])
+                    c2.write(c_email)
+                    c3.write(datetime.fromisoformat(a["start_time"]).strftime("%Y-%m-%d %H:%M"))
+                    c5.write(f"{a['duration_minutes']} min")
+                    c6.write(a["status"].capitalize())
+                    c7.write(a.get("meeting_link") or "—")
+                    if c9.button("❌", key=f"del_future_{a['id']}"):
+                        resp = api_delete_appointment(a["id"])
+                        if resp and resp.status_code == 200:
+                            st.success("Appointment deleted.")
+                        else:
+                            st.error("Delete failed.")
+                        st.query_params(refresh=str(datetime.now().timestamp()))
+
+    with tab_closed:
+        st.subheader("Closed Appointments")
+        closed = [a for a in appts if a["status"] == "closed"]
+        if not closed:
+            st.info("No closed appointments.")
+        else:
+            # Table header
+            h2, h3, h5, h6, h7, h8 = st.columns([2, 2, 2, 2, 3, 3])
+            h2.write("Counsellor")
+            h3.write("Start")
+            h5.write("Duration")
+            h6.write("Status")
+            h7.write("Meeting Link")
+            h8.write("Report")
+
+            for a in closed:
+                c_email = counsellor_map.get(str(a["counsellor_id"]), f"Counsellor {a['counsellor_id']}")
+                c2, c3, c5, c6, c7, c8 = st.columns([2, 2, 2, 2, 3, 3])
+                c2.write(c_email)
+                c3.write(datetime.fromisoformat(a["start_time"]).strftime("%Y-%m-%d %H:%M"))
+                c5.write(f"{a['duration_minutes']} min")
+                c6.write(a["status"].capitalize())
+                c7.write(a.get("meeting_link") or "—")
+                c8.write(a.get("report") or "—")
+
+
+    st.stop()
 
 # ---------------- Counsellor: All videos ----------------
 if st.session_state.view == "counsellor_videos_all":
@@ -1253,6 +1416,8 @@ if st.session_state.view == "counsellor_videos_users":
                             st.error("Delete failed")
 
     st.stop()
+    
+
 
 if st.session_state.view == "manage_counsellors":
     st.header("👥 Manage Counsellors")
