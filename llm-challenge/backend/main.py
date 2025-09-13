@@ -27,7 +27,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, Field, AnyHttpUrl
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, func, desc, Boolean
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship, joinedload
 from passlib.context import CryptContext
 import jwt
 import requests
@@ -91,8 +91,8 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# filepath: f:\Interview\llm-challenge\backend\main.py
 
-# --- models ---
 class Appointment(Base):
     __tablename__ = "appointments"
 
@@ -104,7 +104,11 @@ class Appointment(Base):
     duration_minutes = Column(Integer, nullable=False)
     status = Column(String, default="pending")  # pending / accepted / rejected / closed
 
-    # ✅ New fields you must add
+    # ✅ New relationships
+    user = relationship("User", foreign_keys=[user_id], backref="appointments_as_user")
+    counsellor = relationship("User", foreign_keys=[counsellor_id], backref="appointments_as_counsellor")
+
+    # Other fields
     report = Column(Text, nullable=True)
     meeting_link = Column(String(512), nullable=True)
     reminder_24_sent = Column(Boolean, default=False)
@@ -560,19 +564,13 @@ def search_qdrant(query: str, limit: int = TOP_K, user_id: Optional[int] = None)
         return []
     qvec = embed_texts([query])[0]
 
-    q_filter = None
-    if user_id is not None:
-        q_filter = qmodels.Filter(
-            must=[qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id))]
-        )
 
     # Depending on qdrant-client version, the kwarg is either `query_filter` or `filter`.
     # Most recent clients use `query_filter=`.
     hits = qc.search(
         collection_name=COLLECTION,
         query_vector=qvec,
-        limit=limit,
-        query_filter=q_filter,  # <-- if this errors, change to `filter=q_filter`
+        limit=limit  # <-- if this errors, change to `filter=q_filter`
     )
     results = []
     for h in hits:
@@ -629,7 +627,7 @@ def _str_to_tags(s: Optional[str]) -> List[str]:
     return [t.strip() for t in s.split(",") if t.strip()]
 
 
-OOC_PREFIX = "🌐 I couldn’t find context in your uploaded sources — this answer is drawn from general knowledge!!"
+OOC_PREFIX = "🌐 I couldn’t find context in the uploaded sources — this answer is drawn from general knowledge!!"
 
 
 def is_out_of_context(contexts: List[dict]) -> bool:
@@ -812,6 +810,19 @@ app.add_middleware(
 
 
 # ---------------- Schemas ----------------
+class CounsellorAppointmentCreate(BaseModel):
+    user_id: int
+    start_time: datetime
+    duration_minutes: int
+    meeting_link: str
+
+class AppointmentClose(BaseModel):
+    report: str
+    
+class AppointmentDecision(BaseModel):
+    status: Literal["accepted", "rejected"]
+    meeting_link: Optional[str] = None
+    
 class AppointmentCreate(BaseModel):
     counsellor_id: int
     start_time: datetime
@@ -1076,8 +1087,8 @@ def chat(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get
 
     # Guarantee first line for out-of-context
     reply = (raw_reply or "").strip()
-    # if ooc and not reply.startswith(OOC_PREFIX):
-    #     reply = f"{OOC_PREFIX}\n\n{reply}"
+    if ooc and not reply.startswith(OOC_PREFIX):
+        reply = f"\n\n{reply}"
 
     # Attach ONLY cited sources (based on [n] in reply)
     reply_with_marker = append_cited_sources_marker(reply, numbered_ctx)
@@ -1163,8 +1174,8 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
             body_text = "".join(chunks).strip()
             final_text = body_text
             # If model ignored instruction, ensure the first line is present
-            # if ooc and not final_text.startswith(OOC_PREFIX):
-            #     final_text = f"{OOC_PREFIX}\n\n{final_text}"
+            if ooc and not final_text.startswith(OOC_PREFIX):
+                final_text = f"\n\n{final_text}"
 
             final_text_with_marker = append_cited_sources_marker(final_text, numbered_ctx)
 
@@ -1196,22 +1207,19 @@ def list_videos(q: Optional[str] = None, db: Session = Depends(get_db), user=Dep
 
     if not is_admin_principal(user):
         if getattr(user, "is_counsellor", 0):
-            # counsellor sees "all" + their own uploads
             qry = qry.filter(
                 or_(
-                    Video.access == "all",
-                    Video.added_by == user.email
-                ),
-                Video.is_public == 1
+                    and_(Video.access == "all", Video.is_public == 1),
+                    Video.added_by == user.email,
+                    Video.access.like("user:%")
+                )
             )
         else:
-            # normal user sees "all" + videos targeted to them
             qry = qry.filter(
                 or_(
-                    Video.access == "all",
+                    and_(Video.access == "all", Video.is_public == 1),
                     Video.access == f"user:{user.id}"
-                ),
-                Video.is_public == 1
+                )
             )
 
     if q:
@@ -1301,6 +1309,7 @@ async def start_email_scheduler():
         # 2PM and 8PM IST every day
         scheduler.add_job(_job_wrapper, CronTrigger(hour=14, minute=0, timezone=LOCAL_TZ))
         scheduler.add_job(_job_wrapper, CronTrigger(hour=20, minute=0, timezone=LOCAL_TZ))
+        scheduler.add_job(lambda: send_appointment_reminders(SessionLocal()), CronTrigger(minute="0", hour="*"))
 
         scheduler.start()
         print("[SCHED] Email scheduler started (IST 14:00 & 20:00).")
@@ -1313,6 +1322,35 @@ class VideoUpdate(BaseModel):
     description: Optional[str] = None
     tags: Optional[List[str]] = None
     is_public: Optional[bool] = None
+    
+    
+def send_appointment_reminders(db: Session):
+    now = datetime.utcnow()
+    upcoming = db.query(Appointment).filter(
+        Appointment.status == "accepted",
+        Appointment.start_time > now,
+    ).all()
+
+    sent = 0
+    for ap in upcoming:
+        delta = ap.start_time - now
+
+        # 24h reminder
+        if delta <= timedelta(hours=24) and not ap.reminder_24_sent:
+            send_email(ap.user.email, "Appointment Reminder (24h)",
+                       f"Reminder: You have an appointment with your counsellor at {ap.start_time}.\nMeeting link: {ap.meeting_link}")
+            ap.reminder_24_sent = True
+            sent += 1
+
+        # 12h reminder
+        if delta <= timedelta(hours=12) and not ap.reminder_12_sent:
+            send_email(ap.user.email, "Appointment Reminder (12h)",
+                       f"Reminder: You have an appointment with your counsellor at {ap.start_time}.\nMeeting link: {ap.meeting_link}")
+            ap.reminder_12_sent = True
+            sent += 1
+
+    db.commit()
+    return sent
 
 @app.patch("/admin/videos/{video_id}", response_model=VideoOut)
 def admin_update_video(video_id: str, body: VideoUpdate, db: Session = Depends(get_db), admin=Depends(require_admin)):
@@ -1828,7 +1866,10 @@ def counsellor_add_video(
         added_by=user.email,
         access=access,
     )
+    # print(v)
     db.add(v); db.commit(); db.refresh(v)
+    print("video added:", v.id, v.title, v.added_by, v.access)
+    print(type(v.access))
 
     # convert for response
     return {
@@ -1917,7 +1958,6 @@ def grant_access(body: AccessCreate, user=Depends(get_current_user), db: Session
             <p>User <b>{user.email}</b> has granted you access to the following:</p>
             <ul>
                 <li>Chats: {"Granted" if body.allow_chats else "Not Granted"}</li>
-                <li>Questionnaire Chats: {"Granted" if body.allow_q_chats else "Not Granted"}</li>
                 <li>Dashboard: {"Granted" if body.allow_dashboard else "Not Granted"}</li>
             </ul>
         </div>
@@ -2216,3 +2256,163 @@ def my_appointments(user=Depends(get_current_user), db: Session = Depends(get_db
         for ap in q
     ]
 
+@app.get("/appointments/counsellor")
+def counsellor_appointments(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not user.is_counsellor:
+        raise HTTPException(403, "Only counsellors can view this page")
+
+    q = db.query(Appointment).filter(Appointment.counsellor_id == user.id).order_by(Appointment.start_time.asc()).all()
+    result = []
+    for ap in q:
+        u = db.query(User).get(ap.user_id)
+        result.append({
+            "id": ap.id,
+            "user_email": u.email if u else "Unknown",
+            "counsellor_id": ap.counsellor_id,
+            "start_time": ap.start_time.isoformat(),
+            "end_time": ap.end_time.isoformat(),
+            "duration_minutes": ap.duration_minutes,
+            "status": ap.status,
+            "meeting_link": ap.meeting_link,
+            "report": ap.report,
+        })
+    return result
+
+@app.post("/appointments/{ap_id}/decision")
+def decide_appointment(ap_id: int, decision: AppointmentDecision,
+                       user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not user.is_counsellor:
+        raise HTTPException(403, "Only counsellors can act on appointments")
+
+    ap = db.query(Appointment).get(ap_id)
+    if not ap or ap.counsellor_id != user.id:
+        raise HTTPException(404, "Appointment not found")
+
+    ap.status = decision.status
+    if decision.status == "accepted":
+        ap.meeting_link = decision.meeting_link
+    db.commit()
+    db.refresh(ap)
+
+    # Email user
+    u = db.query(User).get(ap.user_id)
+    if u:
+        if decision.status == "accepted":
+            send_email(u.email, "Appointment Accepted",
+                       f"Your appointment on {ap.start_time} has been accepted.\nMeeting link: {ap.meeting_link}")
+        else:
+            send_email(u.email, "Appointment Rejected",
+                       f"Your appointment on {ap.start_time} was rejected.")
+
+    return {"message": f"Appointment {decision.status}"}
+
+@app.post("/appointments/{ap_id}/close")
+def close_appointment(ap_id: int, close: AppointmentClose,
+                      user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not user.is_counsellor:
+        raise HTTPException(403, "Only counsellors can close appointments")
+
+    ap = db.query(Appointment).get(ap_id)
+    if not ap or ap.counsellor_id != user.id:
+        raise HTTPException(404, "Appointment not found")
+
+    ap.status = "closed"
+    ap.report = close.report
+    db.commit()
+
+    # Email user with report info
+    u = db.query(User).get(ap.user_id)
+    if u:
+        send_email(u.email, "Appointment Closed",
+                   f"Your appointment on {ap.start_time} has been closed.\nReport: {ap.report}")
+
+    return {"message": "Appointment closed"}
+
+# filepath: f:\Interview\llm-challenge\backend\main.py
+@app.post("/appointments/counsellor/create")
+def counsellor_create_appointment(
+    body: CounsellorAppointmentCreate,
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not user.is_counsellor:
+        raise HTTPException(status_code=403, detail="Only counsellors can create appointments.")
+
+    # Log the incoming payload
+    # print("Payload received:", body.dict())
+
+    # Validate user_id
+    target_user = db.query(User).filter(User.id == body.user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Validate start_time
+    if body.start_time <= datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Cannot create appointment in the past")
+
+    # Validate duration
+    if body.duration_minutes <= 0:
+        raise HTTPException(status_code=400, detail="Duration must be greater than 0")
+
+    # Check for overlapping appointments
+    end_time = body.start_time + timedelta(minutes=body.duration_minutes)
+    overlap = (
+        db.query(Appointment)
+        .filter(
+            Appointment.start_time < end_time,
+            Appointment.end_time > body.start_time,
+            or_(
+                Appointment.user_id == body.user_id,
+                Appointment.counsellor_id == user.id,
+            ),
+            Appointment.status.in_(["pending", "accepted"])
+        )
+        .first()
+    )
+    if overlap:
+        raise HTTPException(status_code=400, detail="Appointment overlaps with an existing one.")
+
+    # Create appointment
+    appt = Appointment(
+        user_id=body.user_id,
+        counsellor_id=user.id,
+        start_time=body.start_time,
+        end_time=end_time,
+        duration_minutes=body.duration_minutes,
+        status="accepted",
+        meeting_link=body.meeting_link,
+    )
+    db.add(appt)
+    db.commit()
+    db.refresh(appt)
+
+    # Send email notification
+    try:
+        send_email(
+            to_email=target_user.email,
+            subject="New Appointment Scheduled",
+            html_body=f"""
+            <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+                <p>Your counsellor <b>{user.email}</b> has scheduled an appointment with you.</p>
+                <p><b>Date & Time:</b> {body.start_time.strftime('%Y-%m-%d %H:%M')}</p>
+                <p><b>Meeting link:</b> <a href="{body.meeting_link}">{body.meeting_link}</a></p>
+            </div>
+            """
+        )
+    except Exception as e:
+        print(f"[MAIL] Failed to send appointment email: {e}")
+
+    return {"message": "Appointment created by counsellor", "id": appt.id}
+
+
+@app.get("/counsellor/users")
+def list_users_for_counsellor(
+    user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not user.is_counsellor and not isinstance(user, AdminPrincipal):
+        raise HTTPException(status_code=403, detail="Only counsellors or admins can access this.")
+
+    # Removed invalid `is_admin` filter
+    q = db.query(User).filter(User.is_counsellor == False).all()
+    return [{"id": u.id, "email": u.email} for u in q]

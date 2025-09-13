@@ -278,9 +278,6 @@ def render_meditation_page():
                 # stop audio at end
                 components.html("<audio id='bg_audio'></audio>", height=0)
 
-
-import streamlit as st
-
 def render_yoga_page():
     """
     Yoga page: user selects type of yoga, displays corresponding videos and description.
@@ -290,7 +287,7 @@ def render_yoga_page():
     # Back button
     if st.button("⬅ Back to Dashboard", key="yoga_back"):
         st.session_state.view = "chat"
-        st.experimental_rerun()
+        st.rerun()
 
     st.subheader("Select the type of Yoga you want to practice:")
 
@@ -643,7 +640,7 @@ if not st.session_state.token:
 
             if r is not None and r.status_code == 200:
                 data = r.json()
-                # st.json(data)
+                st.json(data)
                 st.session_state.token = data["access_token"]
                 st.session_state.is_admin = data.get("is_admin", False)
                 st.session_state.is_counsellor = data.get("is_counsellor", False)
@@ -781,11 +778,18 @@ def render_sidebar():
                             st.error(r.json().get("detail", "Upload failed"))
                         except Exception:
                             st.error("Server error during upload")
+                            
             
             with st.expander("👥 User Chats / Questionnaires", expanded=False):
                 if st.button("📂 View Chats & Questionnaires", key="btn_view_granted"):
                     st.session_state.view = "granted_users"
                     st.rerun()
+            
+            with st.expander("🩺 User Consultation", expanded=False):
+                if st.button("📅 Your Appointments"):
+                    st.session_state.view = "counsellor_appointments"
+                    st.rerun()
+
             
             with st.expander("🤖 Your Chats", expanded=False):
                 # Quick actions
@@ -1084,11 +1088,12 @@ if st.session_state.view == "user_videos":
     params = {"q": q} if q else None
     with st.spinner("Loading videos…"):
         rv = api_get("/videos", params=params)
+        
+    # st.json(rv.json())  # debug
     videos = rv.json() if (rv is not None and rv.status_code == 200) else []
     # st.json(videos)
 
     my_id = str(st.session_state.user_id)  
-    # st.markdown(my_id)# always string
     my_videos = [v for v in videos if v.get("access") == f"user:{my_id}"]
 
     if not my_videos:
@@ -1109,6 +1114,222 @@ if st.session_state.view == "user_videos":
                 if v.get("tags"): st.caption("Tags: " + ", ".join(v["tags"]))
                 st.caption(f"Added by: {v.get('added_by', 'unknown')}")
     st.stop()
+
+
+if st.session_state.view == "counsellor_appointments":
+    st.title("👩‍⚕️ My Consultations")
+    if st.button("➕ Create Appointment", key="btn_c_create_appt"):
+        st.session_state.view = "counsellor_create_appointment"
+        st.rerun()
+
+    # --- Search by user email ---
+    search_user = st.text_input("🔍 Search by user email")
+
+    r = api_get("/appointments/counsellor")
+    appts = r.json() if r and r.status_code == 200 else []
+
+    if search_user:
+        appts = [
+            a for a in appts
+            if search_user.lower() in str(a.get("user_email")).lower()
+        ]
+
+    today = datetime.now().date()
+
+    # Tabs
+    tab_today, tab_future, tab_closed = st.tabs(
+        ["Today Appointments", "Future Appointments", "Closed Appointments"]
+    )
+
+    # --- Today ---
+    with tab_today:
+        todays = [
+            a for a in appts
+            if datetime.fromisoformat(a["start_time"]).date() == today
+            and a["status"] != "closed"
+        ]
+        if not todays:
+            st.info("No appointments today.")
+        else:
+            h1, h2, h3, h4, h5, h6, h7 = st.columns([2, 2, 2, 2, 2, 3, 3])
+            h1.write("User")
+            h2.write("Start")
+            h3.write("End")
+            h4.write("Duration")
+            h5.write("Status")
+            h6.write("Meeting Link")
+            h7.write("Action")
+
+            for a in todays:
+                c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([2, 2, 2, 2, 2, 3, 2, 2])
+                c1.write(a["user_email"])
+                c2.write(datetime.fromisoformat(a["start_time"]).strftime("%Y-%m-%d %H:%M"))
+                c3.write(datetime.fromisoformat(a["end_time"]).strftime("%Y-%m-%d %H:%M"))
+                c4.write(f"{a['duration_minutes']} min")
+                c5.write(a["status"].capitalize())
+
+                if a["status"] == "pending":
+                    meeting = c6.text_input("Link", key=f"ml_today_{a['id']}")
+                    if c7.button("✅ Accept", key=f"acc_today_{a['id']}"):
+                        api_post(f"/appointments/{a['id']}/decision",
+                                 {"status": "accepted", "meeting_link": meeting})
+                        st.success("Accepted")
+                        st.rerun()
+                    if c7.button("❌ Reject", key=f"rej_today_{a['id']}"):
+                        api_post(f"/appointments/{a['id']}/decision", {"status": "rejected"})
+                        st.warning("Rejected")
+                        st.rerun()
+
+                elif a["status"] == "accepted":
+                    c6.write(a.get("meeting_link") or "—")
+                    if c7.button("📕 Close", key=f"close_today_{a['id']}"):
+                        report = st.text_area(f"Report for {a['id']}", key=f"rep_today_{a['id']}")
+                        if report.strip():
+                            api_post(f"/appointments/{a['id']}/close", {"report": report})
+                            st.success("Closed")
+                            st.rerun()
+                    if c8.button("🗑 Delete", key=f"del_today_{a['id']}"):
+                        api_delete(f"/appointments/{a['id']}")
+                        st.error("Deleted")
+                        st.rerun()
+
+    # --- Future ---
+    with tab_future:
+        future = [
+            a for a in appts
+            if datetime.fromisoformat(a["start_time"]).date() > today
+            and a["status"] != "closed"
+        ]
+        if not future:
+            st.info("No future appointments.")
+        else:
+            h1, h2, h3, h4, h5, h6, h7 = st.columns([2, 2, 2, 2, 2, 3, 3])
+            h1.write("User")
+            h2.write("Start")
+            h3.write("End")
+            h4.write("Duration")
+            h5.write("Status")
+            h6.write("Meeting Link")
+            h7.write("Action")
+
+            for a in future:
+                c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([2, 2, 2, 2, 2, 3, 2, 2])
+                c1.write(a["user_email"])
+                c2.write(datetime.fromisoformat(a["start_time"]).strftime("%Y-%m-%d %H:%M"))
+                c3.write(datetime.fromisoformat(a["end_time"]).strftime("%Y-%m-%d %H:%M"))
+                c4.write(f"{a['duration_minutes']} min")
+                c5.write(a["status"].capitalize())
+
+                if a["status"] == "pending":
+                    meeting = c6.text_input("Link", key=f"ml_future_{a['id']}")
+                    if c7.button("✅ Accept", key=f"acc_future_{a['id']}"):
+                        api_post(f"/appointments/{a['id']}/decision",
+                                 {"status": "accepted", "meeting_link": meeting})
+                        st.success("Accepted")
+                        st.rerun()
+                    if c7.button("❌ Reject", key=f"rej_future_{a['id']}"):
+                        api_post(f"/appointments/{a['id']}/decision", {"status": "rejected"})
+                        st.warning("Rejected")
+                        st.rerun()
+
+                elif a["status"] == "accepted":
+                    c6.write(a.get("meeting_link") or "—")
+                    if c7.button("📕 Close", key=f"close_future_{a['id']}"):
+                        report = st.text_area(f"Report for {a['id']}", key=f"rep_future_{a['id']}")
+                        if report.strip():
+                            api_post(f"/appointments/{a['id']}/close", {"report": report})
+                            st.success("Closed")
+                            st.rerun()
+                    if c8.button("🗑 Delete", key=f"del_future_{a['id']}"):
+                        api_delete(f"/appointments/{a['id']}")
+                        st.error("Deleted")
+                        st.rerun()
+
+    # --- Closed ---
+    with tab_closed:
+        closed = [a for a in appts if a["status"] == "closed"]
+        if not closed:
+            st.info("No closed appointments.")
+        else:
+            h1, h2, h3, h4, h5, h6, h7 = st.columns([2, 2, 2, 2, 2, 3, 3])
+            h1.write("User")
+            h2.write("Start")
+            h3.write("End")
+            h4.write("Duration")
+            h5.write("Status")
+            h6.write("Report")
+            h7.write("Action")
+
+            for a in closed:
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([2, 2, 2, 2, 2, 3, 3])
+                c1.write(a["user_email"])
+                c2.write(datetime.fromisoformat(a["start_time"]).strftime("%Y-%m-%d %H:%M"))
+                c3.write(datetime.fromisoformat(a["end_time"]).strftime("%Y-%m-%d %H:%M"))
+                c4.write(f"{a['duration_minutes']} min")
+                c5.write(a["status"].capitalize())
+                c6.write(a.get("report") or "—")
+                if c7.button("🗑 Delete", key=f"del_closed_{a['id']}"):
+                    api_delete(f"/appointments/{a['id']}")
+                    st.error("Deleted")
+                    st.rerun()
+
+    st.stop()
+
+    
+if st.session_state.view == "counsellor_create_appointment":
+    st.title("➕ Create Appointment")
+
+    # Back button
+    if st.button("⬅ Back to My Appointments"):
+        st.session_state.view = "counsellor_appointments"
+        st.rerun()
+
+    # Fetch all users
+    ru = api_get("/counsellor/users") # or another endpoint returning user list
+    users = ru.json() if ru and ru.status_code == 200 else []
+    user_map = {u["email"]: u["id"] for u in users}
+
+    sel_user = st.selectbox("Select User", list(user_map.keys())) if users else None
+
+    # Persistent form state
+    if "c_appt_date" not in st.session_state:
+        st.session_state.c_appt_date = datetime.now().date()
+    if "c_appt_time" not in st.session_state:
+        st.session_state.c_appt_time = datetime.now().time()
+    if "c_appt_duration" not in st.session_state:
+        st.session_state.c_appt_duration = 30
+    if "c_appt_meeting" not in st.session_state:
+        st.session_state.c_appt_meeting = ""
+
+    # Inputs
+    date_sel = st.date_input("📅 Date", key="c_appt_date")
+    time_sel = st.time_input("⏰ Time", key="c_appt_time")
+    duration = st.number_input("⌛ Duration (minutes)", min_value=15, step=15, key="c_appt_duration")
+    meeting_link = st.text_input("🔗 Meeting Link", key="c_appt_meeting")
+
+    # Create button
+    if st.button("✅ Create Appointment", key="btn_create_appt") and sel_user:
+        start = datetime.combine(date_sel, time_sel).isoformat()
+        if not sel_user or not start or not duration or not meeting_link:
+            st.error("All fields are required to create an appointment.")
+        elif datetime.fromisoformat(start) <= datetime.now():
+            st.error("Cannot create an appointment in the past.")
+        else:
+            body = {
+                "user_id": user_map[sel_user],
+                "start_time": start,
+                "duration_minutes": duration,
+                "meeting_link": meeting_link,
+            }
+            r = api_post("/appointments/counsellor/create", json=body)
+            if r and r.status_code == 200:
+                st.success("Appointment created successfully")
+                st.session_state.view = "counsellor_appointments"
+                st.rerun()
+            else:
+                st.error("Failed to create appointment")
+    st.stop()
+
 
 if st.session_state.view == "appointments":
     st.title("📅 My Appointments")
@@ -1287,8 +1508,9 @@ if st.session_state.view == "counsellor_videos_all":
                     "is_public": True,
                     "target_user_id": None
                 }
+                print(payload)
                 resp = api_post("/counsellor/videos", json=payload)
-                if resp and resp.status_code in (200, 201):
+                if resp and resp.status_code in (200, 201, 204):
                     st.success("Video added for all users.")
                     st.rerun()
                 else:
@@ -1360,8 +1582,9 @@ if st.session_state.view == "counsellor_videos_users":
                     "description": desc or "",
                     "tags": [t.strip() for t in (tags or "").split(",") if t.strip()],
                     "is_public": False,
-                    "target_user_id": int(user_id)   # must be int, not str
+                    "target_user_id": str(user_id)   # must be int, not str 
                 }
+                print(user_id, type(user_id))
                 resp = api_post("/counsellor/videos", json=payload)
                 if resp and resp.status_code in (200, 201):
                     st.success(f"Video added for {choice}")
@@ -1548,7 +1771,12 @@ if st.session_state.view == "admin":
         with c1: st.markdown(email_html, unsafe_allow_html=True)
         with c2: st.markdown(u.get("role", "user"))   # new role column
         with c3: st.markdown(str(u["conversations"]))
-        with c4: st.markdown(str(u["questionnaire_attempts"]))
+        with c4:
+            if u.get("role") != "counsellor":
+                st.markdown(str(u["questionnaire_attempts"]))
+            else:
+                st.caption("NA")    
+
 
         # Hide questionnaire clear button for counsellors
         with c5:
