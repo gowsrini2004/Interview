@@ -131,6 +131,27 @@ class Video(Base):
     access = Column(String(32), default="all")   # all | users | counsellor | admin | user:<id>
     created_at = Column(DateTime, default=datetime.utcnow)
     
+class ForumTopic(Base):
+    __tablename__ = "forum_topics"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    creator_id = Column(Integer, ForeignKey("users.id"))  # FIXED
+    creator = relationship("User")
+    type = Column(String, default="user")  # "user" or "counsellor"
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ForumReply(Base):
+    __tablename__ = "forum_replies"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    topic_id = Column(String, ForeignKey("forum_topics.id"))
+    topic = relationship("ForumTopic", backref="replies")
+    content = Column(Text, nullable=False)
+    creator_id = Column(Integer, ForeignKey("users.id"))  # FIXED
+    creator = relationship("User")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 
 
@@ -834,6 +855,11 @@ app.add_middleware(
 
 
 # ---------------- Schemas ----------------
+class TopicIn(BaseModel):
+    title: str
+    content: str
+    type: str = "user"
+
 class CounsellorAppointmentCreate(BaseModel):
     user_id: int
     start_time: datetime
@@ -2437,3 +2463,96 @@ def list_users_for_counsellor(
     # Removed invalid `is_admin` filter
     q = db.query(User).filter(User.is_counsellor == False).all()
     return [{"id": u.id, "email": u.email} for u in q]
+
+@app.post("/forum/topics")
+def create_topic(data: TopicIn, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    if data.type == "counsellor" and not getattr(user, "is_counsellor", False):
+        raise HTTPException(status_code=403, detail="Only counsellors can create counsellor forums.")
+    topic = ForumTopic(title=data.title, content=data.content, type=data.type, creator_id=user.id)
+    db.add(topic); db.commit(); db.refresh(topic)
+    return {"id": topic.id, "title": topic.title}
+
+
+@app.get("/forum/topics")
+def list_forum_topics(db: Session = Depends(get_db), user=Depends(get_current_user)):
+    q = db.query(ForumTopic, User).join(User, ForumTopic.creator_id == User.id)
+
+    is_admin = getattr(user, "is_admin", False)  # token may set this
+    is_counsellor = getattr(user, "is_counsellor", False)
+
+    if is_admin or is_counsellor:
+        # counsellors + admin → see everything
+        rows = q.order_by(desc(ForumTopic.created_at)).all()
+    else:
+        # normal users → only user topics
+        rows = q.filter(ForumTopic.type == "user").order_by(desc(ForumTopic.created_at)).all()
+
+    out = []
+    for t, u in rows:
+        out.append({
+            "id": t.id,
+            "title": t.title,
+            "content": t.content,
+            "creator_email": u.email,
+            "creator_role": "counsellor" if u.is_counsellor else "user",
+            "type": t.type,
+            "created_at": t.created_at.isoformat(),
+        })
+    return out
+
+
+
+# --- List Replies ---
+@app.get("/forum/replies")
+def list_forum_replies(topic_id: str, db: Session = Depends(get_db)):
+    rows = db.query(ForumReply, User).join(User, ForumReply.creator_id == User.id).filter(
+        ForumReply.topic_id == topic_id
+    ).order_by(ForumReply.created_at.asc()).all()
+    return [
+        {
+            "id": r.id,
+            "topic_id": r.topic_id,
+            "content": r.content,
+            "creator_email": u.email,
+            "creator_role": "counsellor" if u.is_counsellor else "user",
+            "created_at": r.created_at.isoformat(),
+        }
+        for r, u in rows
+    ]
+
+
+# --- Create Reply ---
+from fastapi import Body
+
+@app.post("/forum/replies")
+def create_reply(
+    data: dict = Body(...),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    topic_id = data["topic_id"]
+    content = data["content"]
+
+    reply = ForumReply(topic_id=topic_id, content=content, creator_id=user.id)
+    db.add(reply)
+    db.commit()
+    db.refresh(reply)
+
+    return {
+        "id": reply.id,
+        "topic_id": topic_id,
+        "content": content,
+        "creator_email": user.email,
+        "creator_role": "counsellor" if user.is_counsellor else "user",
+    }
+
+
+@app.delete("/forum/topic/{topic_id}")
+def delete_topic(topic_id: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    topic = db.query(ForumTopic).filter_by(id=topic_id).first()
+    if not topic:
+        raise HTTPException(404, "Not found")
+    if user.is_admin or getattr(user, "is_counsellor", False) or topic.creator_id == user.id:
+        db.delete(topic); db.commit()
+        return {"ok": True}
+    raise HTTPException(403, "No permission")

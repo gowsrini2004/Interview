@@ -641,7 +641,7 @@ if not st.session_state.token:
 
             if r is not None and r.status_code == 200:
                 data = r.json()
-                st.json(data)
+                # st.json(data)
                 st.session_state.token = data["access_token"]
                 st.session_state.is_admin = data.get("is_admin", False)
                 st.session_state.is_counsellor = data.get("is_counsellor", False)
@@ -758,6 +758,10 @@ def render_sidebar():
                 if st.button("👨‍⚕️Manage Counsellors", key="btn_manage_counsellors"):
                     st.session_state.view = "manage_counsellors"
                     st.rerun()
+            
+            with st.expander("🗨 Forum", expanded=False):
+                if st.button("Enter Forum"):
+                    st.session_state.view = "forum"
 
             # NOTE: Questionnaire & Your Chats are intentionally hidden for Admin.
         
@@ -935,6 +939,9 @@ def render_sidebar():
                 if st.button("🧘Open Yoga Studio", key="sidebar_yoga"):
                     st.session_state.view = "yoga"
                     st.rerun()
+            with st.expander("🗨 Forum", expanded=False):
+                if st.button("Enter Forum"):
+                    st.session_state.view = "forum"
 
 
 
@@ -1102,7 +1109,10 @@ def render_sidebar():
                 if st.button("🧘Open Yoga Studio", key="sidebar_yoga"):
                     st.session_state.view = "yoga"
                     st.rerun()
-
+            
+            with st.expander("🗨 Forum", expanded=False):
+                if st.button("Enter Forum"):
+                    st.session_state.view = "forum"
 
            
 
@@ -1360,6 +1370,109 @@ if st.session_state.view == "counsellor_create_appointment":
                 st.error("Failed to create appointment")
     st.stop()
 
+# ===== Forum List =====
+if st.session_state.view == "forum":
+    st.title("🗨 Forum")
+
+    # --- Create Topic in Expander ---
+    with st.expander("➕ Create a New Topic", expanded=False):
+        title = st.text_input("Title", key="forum_new_title")
+        content = st.text_area("Content", key="forum_new_content")
+        forum_type = "user"
+        if st.session_state.is_counsellor:
+            forum_type = st.selectbox("Forum Type", ["user", "counsellor"], key="forum_new_type")
+
+        if st.button("Post", key="forum_post_btn"):
+            r = api_post("/forum/topics", json={
+                "title": title,
+                "content": content,
+                "type": forum_type
+            })
+            if r and r.status_code == 200:
+                st.success("✅ Topic created!")
+                st.rerun()
+
+    st.markdown("---")
+
+    st.subheader("📋 Forum Topics")
+    r = api_get("/forum/topics")
+    if r and r.status_code == 200:
+        topics = r.json()
+        if not topics:
+            st.info("No topics yet. Be the first to create one!")
+        else:
+            for t in topics:
+                with st.container():
+                    st.markdown(f"""
+                    <div style="padding:14px; margin-bottom:12px; border-radius:10px; 
+                                background-color:#b5b1b1; border:1px solid #ccc;">
+                        <h4 style="margin:0; color:#222;">📌 {t['title']}</h4>
+                        <p style="margin:4px 0; font-size:14px; color:#444;">
+                            By: <b style="color:#000;">{t['creator_email']}</b><br>
+                            Forum Type: {"👥 User Forum" if t['type']=="user" else "🧑‍⚕️ Counsellor Forum"}<br>
+                            Created: {t['created_at'].split("T")[0]}
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    if st.button("➡ Open Topic", key=f"open_{t['id']}"):
+                        st.session_state.view = "forum_topic"
+                        st.session_state.current_topic = t
+                        st.rerun()
+
+
+    st.stop()
+
+# ===== Topic Detail =====
+if st.session_state.view == "forum_topic":
+    topic = st.session_state.get("current_topic")
+    if not topic:
+        st.error("No topic selected.")
+        st.stop()
+
+    # Back button
+    if st.button("⬅ Back to Topics"):
+        st.session_state.view = "forum"
+        st.session_state.current_topic = None
+        st.rerun()
+
+    # Title
+    col1, col2 = st.columns([1,1])
+    with col1:
+        st.markdown(f"## 📝     {topic['title']}")
+        st.caption(f"By: {topic.get('creator_email', 'unknown')}")
+    with col2:
+        # Delete option
+        if st.session_state.is_admin or st.session_state.is_counsellor:
+            if st.button("🗑 Delete Topic", key=f"del_topic_{topic['id']}"):
+                api_delete(f"/forum/topic/{topic['id']}")
+                st.session_state.view = "forum"
+                st.session_state.current_topic = None
+                st.rerun()
+   
+    st.markdown("---")
+
+    # Replies
+    rr = api_get(f"/forum/replies?topic_id={topic['id']}")
+    replies = rr.json() if rr and rr.status_code == 200 else []
+
+    if not replies:
+        st.info("No replies yet. Start the conversation!")
+    else:
+        for r in replies:
+            with st.chat_message("user" if r["creator_role"] == "user" else "assistant"):
+                st.markdown(f"**from {r['creator_email']}**")
+                st.markdown(r["content"])
+
+    # Add Reply (chat input style)
+    reply_text = st.chat_input("💬 Write your reply…")
+    if reply_text:
+        api_post("/forum/replies", json={"topic_id": topic["id"], "content": reply_text})
+        st.rerun()
+    st.stop()
+
+
+# 
 
 if st.session_state.view == "appointments":
     st.title("📅 My Appointments")
