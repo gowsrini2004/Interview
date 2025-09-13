@@ -407,6 +407,33 @@ def api_delete(path: str, timeout=60):
         st.error(f"DELETE {path} failed: {e}")
         return None
 
+def api_request_access_mail(user_id: int, access_type: str):
+    return api_post("/counsellor/request-access", {"user_id": user_id, "type": access_type})
+
+# user access helpers
+def api_user_post_access(json_body):
+    return api_post("/user/access", json=json_body)
+
+def api_user_get_access():
+    return api_get("/user/access")
+
+def api_user_patch_access(access_id, json_body):
+    return api_patch(f"/user/access/{access_id}", json=json_body)
+
+def api_user_delete_access(access_id):
+    return api_delete(f"/user/access/{access_id}")
+def api_counsellor_get_access():
+    return api_get("/counsellor/access")
+
+def api_counsellor_user_sessions(user_id):
+    return api_get(f"/counsellor/users/{user_id}/sessions")
+
+def api_counsellor_user_messages(user_id, session_id):
+    return api_get(f"/counsellor/users/{user_id}/sessions/{session_id}/messages")
+
+def api_counsellor_user_dashboard(user_id):
+    return api_get(f"/counsellor/users/{user_id}/questionnaire/dashboard")
+
 def refresh_sessions():
     r = api_get("/sessions")
     st.session_state.sessions = r.json() if (r is not None and r.status_code == 200) else []
@@ -746,6 +773,11 @@ def render_sidebar():
                         except Exception:
                             st.error("Server error during upload")
             
+            with st.expander("👥 User Chats / Questionnaires", expanded=False):
+                if st.button("📂 View Chats & Questionnaires", key="btn_view_granted"):
+                    st.session_state.view = "granted_users"
+                    st.rerun()
+            
             with st.expander("🤖 Your Chats", expanded=False):
                 # Quick actions
                 colA, colB = st.columns([1, 1])
@@ -868,7 +900,11 @@ def render_sidebar():
             # Utility (User)
             with st.expander("⚙️ Utility", expanded=False):
                 st.caption("Role: **User**")
-
+                
+                if st.button("🔐 Grant Permission to Counsellors", key="btn_grant_access"):
+                    st.session_state.view = "grant_access"
+                    st.rerun()
+                
                 st.markdown("**Model Provider**")
                 st.session_state.provider = st.selectbox(
                     "Choose provider",
@@ -882,6 +918,8 @@ def render_sidebar():
                     value=st.session_state.get("streaming", True),
                     key="streaming"
                 )
+
+
             
              # Your Chats (User only)
             with st.expander("🤖 Your Chats", expanded=False):
@@ -1395,7 +1433,170 @@ if st.session_state.view == "yoga":
     render_yoga_page()
     st.stop()
     
+if st.session_state.view == "grant_access":
+    st.title("🔐 Grant Access to Counsellors")
+
+    # Load counsellors
+    rc = api_get("/public/counsellors")
+    counsellors = rc.json() if (rc and rc.status_code == 200) else []
+    counsellor_map = {str(c["id"]): c["email"] for c in counsellors}
     
+    st.markdown("### Grant permission to a counsellor")
+    with st.form("grant_access_form", clear_on_submit=True):
+        sel = st.selectbox("Select counsellor", options=list(counsellor_map.keys()),
+                           format_func=lambda x: counsellor_map.get(x, ""), key="grant_sel")
+        allow_chats = st.checkbox("Allow: Chats", value=False)
+        allow_dashboard = st.checkbox("Allow: Questionnaire dashboard", value=False)
+        submitted = st.form_submit_button("Grant Access")
+        if submitted:
+            body = {
+                "counsellor_id": int(sel),
+                "allow_chats": allow_chats,
+                "allow_dashboard": allow_dashboard
+            }
+            r = api_user_post_access(body)
+            if r and r.status_code == 200:
+                st.success("Access granted/updated.")
+                st.rerun()
+            else:
+                try: st.error(r.json().get("detail","Failed"))
+                except: st.error("Failed")
+
+    st.markdown("---")
+    st.markdown("### Your current grants")
+    r = api_user_get_access()
+    grants = r.json() if (r and r.status_code == 200) else []
+    if not grants:
+        st.info("No grants yet.")
+    else:
+        for g in grants:
+            cols = st.columns([3,2,1,1])
+            cols[0].markdown(f"**{g['counsellor_email']}**")
+            cols[1].markdown(f"Chats: {g['allow_chats']}<br>Dashboard: {g['allow_dashboard']}", unsafe_allow_html=True)
+            if cols[2].button("Edit", key=f"edit_acc_{g['id']}"):
+                new_chats = st.checkbox("Allow Chats", value=g['allow_chats'], key=f"ec_{g['id']}_ch")
+                new_dash = st.checkbox("Allow Dashboard", value=g['allow_dashboard'], key=f"ec_{g['id']}_d")
+                if st.button("Save", key=f"save_acc_{g['id']}"):
+                    patch = {"allow_chats": new_chats, "allow_dashboard": new_dash}
+                    rr = api_user_patch_access(g['id'], patch)
+                    if rr and rr.status_code == 200:
+                        st.success("Updated."); st.rerun()
+                    else:
+                        st.error("Update failed.")
+            if cols[3].button("Revoke", key=f"del_acc_{g['id']}"):
+                rr = api_user_delete_access(g['id'])
+                if rr and rr.status_code == 200:
+                    st.success("Revoked."); st.rerun()
+                else:
+                    st.error("Failed to revoke")
+    st.stop()
+   
+if st.session_state.view == "granted_users":
+    st.title("👥 Users Who Granted You Access")
+
+    if st.button("⬅ Back"):
+        st.session_state.view = "counsellor"; st.rerun()
+
+    r = api_counsellor_get_access()
+    grants = r.json() if (r and r.status_code == 200) else []
+
+    if not grants:
+        st.info("No users have granted you access yet.")
+        st.stop()
+        
+    if st.session_state.get("_selected_user"):
+        uid = st.session_state._selected_user
+        mode = st.session_state.get("granted_view_mode")
+        uname = st.session_state.get("_selected_user_email", "")
+        st.markdown(f"#### 🔎 {uname} — {mode.capitalize()}")
+
+        if st.button("⬅ Back to User List"):
+            st.session_state._selected_user = None
+            st.session_state.granted_view_mode = None
+            st.rerun()
+
+        if mode == "chats":
+            r = api_counsellor_user_sessions(uid)
+            sess = r.json() if (r and r.status_code == 200) else []
+            if not sess:
+                st.info("No chat sessions found.")
+            else:
+                for s in sess:
+                    with st.expander(f"💬 {s['title'] or 'Chat'} — {s['created_at']}"):
+                        msgs_r = api_counsellor_user_messages(uid, s['id'])
+                        msgs = msgs_r.json() if (msgs_r and msgs_r.status_code == 200) else []
+                        if not msgs:
+                            st.info("No messages yet.")
+                        else:
+                            for m in msgs:
+                                role = m.get("role")
+                                ts = m.get("created_at", "")
+                                if role == "user":
+                                    st.markdown(f"**Q:** {m.get('content')}  _(at {ts})_")
+                                else:
+                                    st.markdown(f"**A:** {m.get('content')}  _(at {ts})_")
+
+        elif mode == "dashboard":
+            r = api_counsellor_user_dashboard(uid)
+            data = r.json() if (r and r.status_code == 200) else []
+            if not data:
+                st.info("No dashboard data.")
+            else:
+                df = pd.DataFrame(data)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        st.markdown("---")
+
+                
+    st.markdown("### Your Granted Users")
+    for g in grants:
+        with st.expander(f"{g['user_email']} (ID: {g['user_id']})", expanded=False):
+            cols = st.columns(2)
+            with cols[0]:
+            # CHATS ACCESS
+                if g["allow_chats"]:
+                    if st.button("💬 View Chats", key=f"chats_{g['user_id']}"):
+                        st.session_state._selected_user = g["user_id"]
+                        st.session_state._selected_user_email = g["user_email"]
+                        st.session_state.granted_view_mode = "chats"
+                        st.rerun()
+                else:
+                    cols = st.columns([1,1])
+                    with cols[1]:
+                        st.markdown("❌ Chats: No access")
+                    with cols[0]:
+                        if st.button("Request Chat Access", key=f"req_chats_{g['user_id']}"):
+                            rr = api_request_access_mail(g["user_id"], "chats")
+                            if rr and rr.status_code == 200:
+                                st.success("Request for chat access sent via email.")
+                            else:
+                                st.error("Failed to send email request.")
+            with cols[1]:
+            # DASHBOARD ACCESS
+                if g["allow_dashboard"]:
+                    if st.button("📊 View Dashboard", key=f"dash_{g['user_id']}"):
+                        st.session_state._selected_user = g["user_id"]
+                        st.session_state._selected_user_email = g["user_email"]
+                        st.session_state.granted_view_mode = "dashboard"
+                        st.rerun()
+                else:
+                    cols = st.columns([1,1])
+                    with cols[1]:
+                        st.markdown("❌ Dashboard: No access")
+                    with cols[0]:
+                        if st.button("Request Dashboard Access", key=f"req_dash_{g['user_id']}"):
+                            rr = api_request_access_mail(g["user_id"], "dashboard")
+                            if rr and rr.status_code == 200:
+                                st.success("Request for dashboard access sent via email.")
+                            else:
+                                st.error("Failed to send email request.")
+
+    # --- DETAIL VIEWS ---
+    
+
+    st.stop()
+
+                
+ 
 # -------- videos view --------
 if st.session_state.view == "videos":
     st.subheader("🎬 Video Library")
@@ -1561,7 +1762,6 @@ if (not st.session_state.is_admin) and st.session_state.q_session_id and st.sess
                         st.markdown("**Tips**")
                         for t in tips: st.markdown(f"- {t}")
                 st.session_state.q_session_id = None
-                st.session_state.session_id = None   # optional: also close that chat
                 st.rerun()
             else:
                 with st.chat_message("assistant"):

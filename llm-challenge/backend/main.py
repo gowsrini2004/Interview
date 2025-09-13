@@ -106,6 +106,17 @@ class Video(Base):
     access = Column(String(32), default="all")   # all | users | counsellor | admin | user:<id>
     created_at = Column(DateTime, default=datetime.utcnow)
     
+
+
+
+class AccessRequest(Base):
+    __tablename__ = "access_requests"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)          # target user
+    counsellor_id = Column(Integer, ForeignKey("users.id"), index=True)    # requester
+    request_type = Column(String, index=True)   # "chats" | "dashboard" | "qchats"
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
 class CounsellorProfile(Base):
     __tablename__ = "counsellor_profiles"
     user_id = Column(Integer, ForeignKey("users.id"), primary_key=True, index=True)
@@ -130,6 +141,15 @@ class Conversation(Base):
     title = Column(String(255))
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class UserAccess(Base):
+    __tablename__ = "user_access"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)          # owner
+    counsellor_id = Column(Integer, ForeignKey("users.id"), index=True)    # counsellor
+    allow_chats = Column(Integer, default=0)
+    allow_q_chats = Column(Integer, default=0)
+    allow_dashboard = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 class Message(Base):
     __tablename__ = "messages"
@@ -612,7 +632,7 @@ def build_prompt_with_numbered_context(user_msg: str, contexts: List[dict]) -> t
     """
     Returns: (prompt, numbered_contexts, out_of_context_flag)
     - numbered_contexts: contexts[:TOP_K] with .index
-    - prompt instructs the model to cite using [n] and to emit OOC_PREFIX if out-of-context
+    - prompt instructs the model to cite using [n] properly and to emit OOC_PREFIX if out-of-context
     """
     system_prompt = (
         "You are a compassionate, knowledgeable mental wellness assistant. "
@@ -760,6 +780,7 @@ def call_groq(prompt: str, num_predict: int = 512) -> str:
     except Exception as e:
         print("[LLM] Groq SDK call failed:", e)
         return "Groq API is not available right now."
+    
 
 
 # ---------------- FastAPI ----------------
@@ -774,6 +795,10 @@ app.add_middleware(
 
 
 # ---------------- Schemas ----------------
+class AccessRequestIn(BaseModel):
+    user_id: int
+    request_type: Literal["chats", "dashboard"]
+
 class VideoCreate(BaseModel):
     title: str
     url: str
@@ -817,6 +842,17 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     identifier: str  # email OR "admin"
     password: str
+    
+class AccessCreate(BaseModel):
+    counsellor_id: int
+    allow_chats: bool = False
+    allow_q_chats: bool = False
+    allow_dashboard: bool = False
+
+class AccessUpdate(BaseModel):
+    allow_chats: Optional[bool] = None
+    allow_q_chats: Optional[bool] = None
+    allow_dashboard: Optional[bool] = None
 
 class ChatIn(BaseModel):
     message: str
@@ -879,6 +915,7 @@ def short_title(text: str) -> str:
 
 def username_from_email(email: str) -> str:
     return (email or "").split("@", 1)[0] or "there"
+
 
 
 # ---------------- Routes: meta ----------------
@@ -1017,8 +1054,8 @@ def chat(body: ChatIn, user=Depends(get_current_user), db: Session = Depends(get
 
     # Guarantee first line for out-of-context
     reply = (raw_reply or "").strip()
-    if ooc and not reply.startswith(OOC_PREFIX):
-        reply = f"{OOC_PREFIX}\n\n{reply}"
+    # if ooc and not reply.startswith(OOC_PREFIX):
+    #     reply = f"{OOC_PREFIX}\n\n{reply}"
 
     # Attach ONLY cited sources (based on [n] in reply)
     reply_with_marker = append_cited_sources_marker(reply, numbered_ctx)
@@ -1062,10 +1099,6 @@ def chat_stream(body: ChatIn, user=Depends(get_current_user), db: Session = Depe
         chunks: List[str] = []
 
         try:
-            # Show the emoji line FIRST if OOC
-            if ooc:
-                yield json.dumps({"type":"delta","text": f"{OOC_PREFIX}\n\n"}) + "\n"
-
             if body.provider == "groq":
                 if not _groq_client:
                     yield json.dumps({"type":"delta","text":"[Groq key missing]\n"}) + "\n"
@@ -1613,6 +1646,8 @@ def admin_delete_user(user_id: int, db: Session = Depends(get_db), admin=Depends
     db.query(QuestionnaireSession).filter(QuestionnaireSession.user_id == user_id).delete()
     db.query(CounsellorProfile).filter(CounsellorProfile.user_id == user_id).delete()   # NEW
     db.query(User).filter(User.id == user_id).delete()
+    db.query(UserAccess).filter(or_(UserAccess.user_id == user_id, UserAccess.counsellor_id == user_id)).delete()
+
     db.commit()
     return {"ok": True}
 
@@ -1802,3 +1837,229 @@ def counsellor_list_users(user=Depends(get_current_user), db: Session = Depends(
         raise HTTPException(status_code=403, detail="Counsellors only")
     users = db.query(User).filter(User.is_counsellor == 0).all()
     return [{"id": u.id, "email": u.email} for u in users]
+
+@app.post("/user/access")
+def grant_access(body: AccessCreate, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admins cannot grant access.")
+    # verify counsellor exists
+    c = db.query(User).filter(User.id == body.counsellor_id, User.is_counsellor == 1).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Counsellor not found")
+
+    # If an existing grant already exists for this pair, update it instead
+    existing = db.query(UserAccess).filter(UserAccess.user_id == user.id, UserAccess.counsellor_id == body.counsellor_id).first()
+    if existing:
+        existing.allow_chats = 1 if body.allow_chats else 0
+        existing.allow_q_chats = 1 if body.allow_q_chats else 0
+        existing.allow_dashboard = 1 if body.allow_dashboard else 0
+        db.commit(); db.refresh(existing)
+        return {"ok": True, "id": existing.id, "updated": True}
+
+    acc = UserAccess(
+        user_id=user.id,
+        counsellor_id=body.counsellor_id,
+        allow_chats=1 if body.allow_chats else 0,
+        allow_q_chats=1 if body.allow_q_chats else 0,
+        allow_dashboard=1 if body.allow_dashboard else 0,
+    )
+    db.add(acc); db.commit(); db.refresh(acc)
+    return {"ok": True, "id": acc.id}
+
+
+@app.get("/user/access")
+def list_my_access(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.query(UserAccess, User).join(User, User.id == UserAccess.counsellor_id).filter(UserAccess.user_id == user.id).all()
+    out = []
+    for acc, c in rows:
+        out.append({
+            "id": acc.id,
+            "counsellor_id": acc.counsellor_id,
+            "counsellor_email": c.email,
+            "allow_chats": bool(acc.allow_chats),
+            "allow_q_chats": bool(acc.allow_q_chats),
+            "allow_dashboard": bool(acc.allow_dashboard),
+            "created_at": acc.created_at.isoformat(),
+        })
+    return out
+
+
+@app.patch("/user/access/{access_id}")
+def update_my_access(access_id: int, body: AccessUpdate, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    acc = db.query(UserAccess).filter(UserAccess.id == access_id, UserAccess.user_id == user.id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Access record not found")
+    if body.allow_chats is not None: acc.allow_chats = 1 if body.allow_chats else 0
+    if body.allow_q_chats is not None: acc.allow_q_chats = 1 if body.allow_q_chats else 0
+    if body.allow_dashboard is not None: acc.allow_dashboard = 1 if body.allow_dashboard else 0
+    db.commit(); db.refresh(acc)
+    return {"ok": True}
+
+
+@app.delete("/user/access/{access_id}")
+def delete_my_access(access_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    acc = db.query(UserAccess).filter(UserAccess.id == access_id, UserAccess.user_id == user.id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Access record not found")
+    db.delete(acc); db.commit()
+    return {"ok": True}
+
+# -------- Counsellor: view grants given to them --------
+@app.get("/counsellor/access")
+def counsellor_access(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not getattr(user, "is_counsellor", 0):
+        raise HTTPException(status_code=403, detail="Counsellors only")
+    rows = db.query(UserAccess, User).join(User, User.id == UserAccess.user_id).filter(UserAccess.counsellor_id == user.id).all()
+    out = []
+    for acc, u in rows:
+        out.append({
+            "id": acc.id,
+            "user_id": u.id,
+            "user_email": u.email,
+            "allow_chats": bool(acc.allow_chats),
+            "allow_q_chats": bool(acc.allow_q_chats),
+            "allow_dashboard": bool(acc.allow_dashboard),
+            "created_at": acc.created_at.isoformat(),
+        })
+    return out
+
+# -------- Counsellor: fetch sessions for a user (only when allowed) --------
+@app.get("/counsellor/users/{user_id}/sessions")
+def counsellor_user_sessions(user_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not getattr(user, "is_counsellor", 0):
+        raise HTTPException(status_code=403, detail="Counsellors only")
+    acc = db.query(UserAccess).filter(UserAccess.user_id == user_id, UserAccess.counsellor_id == user.id, UserAccess.allow_chats == 1).first()
+    if not acc:
+        raise HTTPException(status_code=403, detail="Access to chats not granted by user")
+    rows = db.query(Conversation).filter(Conversation.user_id == user_id).order_by(Conversation.created_at.desc()).all()
+    return [{"id": r.id, "title": r.title, "created_at": r.created_at.isoformat()} for r in rows]
+
+
+# -------- Counsellor: fetch messages in a user's session (only when allowed) --------
+@app.get("/counsellor/users/{user_id}/sessions/{session_id}/messages")
+def counsellor_user_session_messages(user_id: int, session_id: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not getattr(user, "is_counsellor", 0):
+        raise HTTPException(status_code=403, detail="Counsellors only")
+    acc = db.query(UserAccess).filter(UserAccess.user_id == user_id, UserAccess.counsellor_id == user.id, UserAccess.allow_chats == 1).first()
+    if not acc:
+        raise HTTPException(status_code=403, detail="Access to chats not granted by user")
+    msgs = (
+        db.query(Message)
+        .filter(Message.conversation_id == session_id, Message.user_id == user_id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    return [{"role": m.role, "content": m.content, "created_at": m.created_at.isoformat()} for m in msgs]
+
+
+# -------- Counsellor: fetch questionnaire dashboard for a user (only when allowed) --------
+@app.get("/counsellor/users/{user_id}/questionnaire/dashboard")
+def counsellor_user_questionnaire_dashboard(user_id: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not getattr(user, "is_counsellor", 0):
+        raise HTTPException(status_code=403, detail="Counsellors only")
+    acc = db.query(UserAccess).filter(UserAccess.user_id == user_id, UserAccess.counsellor_id == user.id, UserAccess.allow_dashboard == 1).first()
+    if not acc:
+        raise HTTPException(status_code=403, detail="Access to dashboard not granted by user")
+
+    # reuse logic from /questionnaire/dashboard but for another user
+    agg_rows = (
+        db.query(
+            QuestionnaireAttempt.day.label("day"),
+            func.count(QuestionnaireAttempt.id).label("attempts"),
+            func.avg(QuestionnaireAttempt.score).label("avg_score"),
+        )
+        .filter(QuestionnaireAttempt.user_id == user_id)
+        .group_by(QuestionnaireAttempt.day)
+        .order_by(desc(QuestionnaireAttempt.day))
+        .all()
+    )
+
+    sub_latest = (
+        db.query(
+            QuestionnaireAttempt.day.label("day"),
+            func.max(QuestionnaireAttempt.created_at).label("max_ts"),
+        )
+        .filter(QuestionnaireAttempt.user_id == user_id)
+        .group_by(QuestionnaireAttempt.day)
+        .subquery()
+    )
+
+    latest_rows = (
+        db.query(QuestionnaireAttempt.day, QuestionnaireAttempt.comment)
+        .join(sub_latest, (QuestionnaireAttempt.day == sub_latest.c.day) & (QuestionnaireAttempt.created_at == sub_latest.c.max_ts))
+        .filter(QuestionnaireAttempt.user_id == user_id)
+        .all()
+    )
+    latest_map = {d: c for d, c in latest_rows}
+
+    out = []
+    for r in agg_rows:
+        out.append({
+            "day": r.day,
+            "attempts": int(r.attempts or 0),
+            "avg_score": round(float(r.avg_score or 0.0), 2),
+            "latest_comment": latest_map.get(r.day, None),
+        })
+    return out
+
+@app.get("/public/counsellors")
+def public_list_counsellors(db: Session = Depends(get_db)):
+    rows = (
+        db.query(User, CounsellorProfile)
+        .join(CounsellorProfile, CounsellorProfile.user_id == User.id)
+        .filter(User.is_counsellor == 1)
+        .all()
+    )
+    out = [{"id": u.id, "email": u.email, "name": c.name, "experience_years": c.experience_years} for u,c in rows]
+    return out
+
+@app.post("/counsellor/request-access")
+def request_access(
+    payload: AccessRequestIn,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    # Only counsellors allowed
+    if not getattr(user, "is_counsellor", 0):
+        raise HTTPException(status_code=403, detail="Counsellors only")
+
+    # Check target user exists
+    target = db.query(User).filter(User.id == payload.user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Target user not found")
+
+    # 🔥 Removed duplicate check — every call creates a new request
+    req = AccessRequest(
+        user_id=payload.user_id,
+        counsellor_id=user.id,
+        request_type=payload.request_type
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+
+    # ---- Send email ----
+    send_email(
+        target.email,
+        "Access Request",
+        f"Counsellor {user.email} is requesting access to your {payload.request_type}. "
+        "Please log in to grant this request."
+    )
+
+    return {"ok": True, "msg": "Request sent", "request_id": req.id}
+
+
+def send_email(to_email: str, subject: str, body: str):
+    """Send a simple email via MailHog SMTP"""
+    msg = MIMEText(body, "plain")
+    msg["From"] = "noreply@Psych.com"
+    msg["To"] = to_email
+    msg["Subject"] = subject
+
+    try:
+        with smtplib.SMTP("mailhog", 1025) as server:  # "localhost" if not in docker
+            server.sendmail(msg["From"], [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        print("Email send failed:", e)
+        return False
