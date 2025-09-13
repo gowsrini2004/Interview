@@ -100,11 +100,10 @@ class Video(Base):
     url = Column(String(512), nullable=False)
     platform = Column(String(32), default="youtube")
     description = Column(Text)
-    tags = Column(String(255))  # comma-separated
-    is_public = Column(Integer, default=1)  # keep existing if you already added it
-    # NEW:
-    added_by = Column(String(255), default="admin")    # 'admin' for now
-    access = Column(String(32), default="all")         # 'all' | 'users' | 'counsellor' | 'admin'
+    tags = Column(String(255))
+    is_public = Column(Integer, default=1)
+    added_by = Column(String(255), default="admin")
+    access = Column(String(32), default="all")   # all | users | counsellor | admin | user:<id>
     created_at = Column(DateTime, default=datetime.utcnow)
     
 class CounsellorProfile(Base):
@@ -776,11 +775,12 @@ app.add_middleware(
 
 # ---------------- Schemas ----------------
 class VideoCreate(BaseModel):
-    title: str = Field(..., max_length=255)
-    url: AnyHttpUrl  # or str if you prefer
+    title: str
+    url: str
     description: Optional[str] = None
-    tags: Optional[List[str]] = None
+    tags: List[str] = []
     is_public: bool = True
+    target_user_id: Optional[int] = None
     
 class CounsellorUpdate(BaseModel):
     name: Optional[str] = None
@@ -907,14 +907,14 @@ def register(payload: RegisterIn, db: Session = Depends(get_db)):
     user = User(email=payload.email, password_hash=hash_password(payload.password))
     db.add(user); db.commit(); db.refresh(user)
     token = create_access_token(user.email)
-    return {"access_token": token, "token_type": "bearer", "is_admin": False, "is_counsellor": bool(user.is_counsellor)}
+    return {"access_token": token, "token_type": "bearer", "is_admin": False, "is_counsellor": bool(user.is_counsellor),"user_id": user.id}
 
 @app.post("/auth/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
     # Hardcoded admin login
     if payload.identifier == "admin" and payload.password == "admin":
         token = create_access_token("admin")
-        return {"access_token": token, "token_type": "bearer", "is_admin": True, "is_counsellor": False}
+        return {"access_token": token, "token_type": "bearer", "is_admin": True, "is_counsellor": False, "user_id": None}
 
     # Normal user flow
     user = db.query(User).filter(User.email == payload.identifier).first()
@@ -926,6 +926,7 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
         "token_type": "bearer",
         "is_admin": False,
         "is_counsellor": bool(getattr(user, "is_counsellor", False)),
+        "user_id": user.id,
     }
 
     # Normal user flow
@@ -1139,13 +1140,32 @@ def list_videos(q: Optional[str] = None, db: Session = Depends(get_db), user=Dep
     qry = db.query(Video)
 
     if not is_admin_principal(user):
-        qry = qry.filter(Video.access.in_(["all", "users"]), Video.is_public == 1)
+        if getattr(user, "is_counsellor", 0):
+            # counsellor sees "all" + their own uploads
+            qry = qry.filter(
+                or_(
+                    Video.access == "all",
+                    Video.added_by == user.email
+                ),
+                Video.is_public == 1
+            )
+        else:
+            # normal user sees "all" + videos targeted to them
+            qry = qry.filter(
+                or_(
+                    Video.access == "all",
+                    Video.access == f"user:{user.id}"
+                ),
+                Video.is_public == 1
+            )
 
     if q:
         like = f"%{q.strip()}%"
-        qry = qry.filter(or_(Video.title.ilike(like),
-                             Video.description.ilike(like),
-                             Video.tags.ilike(like)))
+        qry = qry.filter(or_(
+            Video.title.ilike(like),
+            Video.description.ilike(like),
+            Video.tags.ilike(like)
+        ))
 
     rows = qry.order_by(desc(Video.created_at)).all()
     return [{
@@ -1723,3 +1743,62 @@ def admin_demote_counsellor(user_id: int, db: Session = Depends(get_db), admin=D
     db.commit()
     return {"ok": True}
 
+def _str_to_tags(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    return [t.strip() for t in s.split(",") if t.strip()]
+
+@app.post("/counsellor/videos", response_model=VideoOut)
+def counsellor_add_video(
+    body: VideoCreate,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    if not getattr(user, "is_counsellor", 0):
+        raise HTTPException(status_code=403, detail="Counsellor only")
+
+    url = normalize_youtube_url(str(body.url))
+    access = "all" if body.target_user_id is None else f"user:{body.target_user_id}"
+
+    v = Video(
+        id=str(uuid.uuid4()),
+        title=body.title.strip(),
+        url=url,
+        platform="youtube",
+        description=(body.description or "").strip() or None,
+        tags=_tags_to_str(body.tags),   # store as string
+        is_public=1 if body.is_public else 0,
+        added_by=user.email,
+        access=access,
+    )
+    db.add(v); db.commit(); db.refresh(v)
+
+    # convert for response
+    return {
+        **v.__dict__,
+        "tags": _str_to_tags(v.tags)
+    }
+    
+@app.delete("/counsellor/videos/{video_id}")
+def counsellor_delete_video(video_id: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
+    if is_admin_principal(user):
+        raise HTTPException(status_code=403, detail="Admins should use /admin/videos delete")
+
+    v = db.query(Video).filter(Video.id == video_id).first()
+    if not v:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # ✅ Only allow deletion if this counsellor uploaded it
+    if getattr(user, "is_counsellor", 0) != 1:
+        raise HTTPException(status_code=403, detail="Only counsellors can delete videos")
+
+    db.delete(v)
+    db.commit() 
+    return {"ok": True}
+
+@app.get("/counsellor/users")
+def counsellor_list_users(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if not getattr(user, "is_counsellor", False):
+        raise HTTPException(status_code=403, detail="Counsellors only")
+    users = db.query(User).filter(User.is_counsellor == 0).all()
+    return [{"id": u.id, "email": u.email} for u in users]

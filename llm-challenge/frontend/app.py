@@ -46,6 +46,9 @@ if "streaming" not in st.session_state: st.session_state.streaming = True
 if "view" not in st.session_state: st.session_state.view = "chat"  # chat | dashboard | admin
 if "username" not in st.session_state: st.session_state.username = ""
 if "q_session_id" not in st.session_state: st.session_state.q_session_id = None
+if "user_id" not in st.session_state: st.session_state.user_id = None
+
+
 
 # Admin table action state (3-dots)
 if "actions_user" not in st.session_state: st.session_state.actions_user = None
@@ -91,6 +94,8 @@ def render_meditation_page():
     st.session_state.setdefault("room_is_running", False)
     st.session_state.setdefault("room_sound_choice", "Omkara (chant)")
     st.session_state.setdefault("room_minutes", 15)
+    
+    
 
     st.title("🧘 Meditation Space")
 
@@ -602,9 +607,11 @@ if not st.session_state.token:
 
             if r is not None and r.status_code == 200:
                 data = r.json()
+                # st.json(data)
                 st.session_state.token = data["access_token"]
                 st.session_state.is_admin = data.get("is_admin", False)
                 st.session_state.is_counsellor = data.get("is_counsellor", False)
+                st.session_state.user_id = data.get("user_id")
                 h = api_get("/health")
                 if h is not None and h.status_code == 200:
                     me = h.json().get("me", {})
@@ -697,6 +704,7 @@ def render_sidebar():
                 if st.button("🎬 Open Library", key="btn_videos_admin", use_container_width=True):
                     st.session_state.view = "videos"
                     st.rerun()
+
             
             with st.expander("👥 Manage Counsellors", expanded=False):
                 if st.button("👨‍⚕️Manage Counsellors", key="btn_manage_counsellors"):
@@ -832,6 +840,16 @@ def render_sidebar():
                                 st.rerun()
                         st.markdown("---")
 
+            with st.sidebar.expander("🎬 Video Gallery", expanded=False):
+                if st.button("🌍 All Video Gallery", key="btn_counsellor_videos_all", use_container_width=True):
+                    st.session_state.view = "counsellor_videos_all"
+                    st.rerun()
+
+                if st.button("👤 User Video Gallery", key="btn_counsellor_videos_users", use_container_width=True):
+                    st.session_state.view = "counsellor_videos_users"
+                    st.rerun()
+
+
             with st.expander("🧘 Meditate", expanded=False):
                     if st.button("🧘 Guided Meditation"):
                         st.session_state.view = "meditation"; st.session_state.med_page = "guided"; st.rerun()
@@ -843,8 +861,6 @@ def render_sidebar():
                     st.session_state.view = "yoga"
                     st.rerun()
 
-
-            # Your Chats (User only)
 
 
         # ------------------ USER VIEW ------------------
@@ -986,6 +1002,9 @@ def render_sidebar():
                 if st.button("🎬 Open Library", key="btn_videos_user", use_container_width=True):
                     st.session_state.view = "videos"
                     st.rerun()
+                if st.button("🎬 My Assigned Videos", key="btn_user_videos", use_container_width=True):
+                    st.session_state.view = "user_videos"
+                    st.rerun()
                     
             with st.sidebar:
                 with st.expander("🧘 Meditate", expanded=False):
@@ -1003,6 +1022,200 @@ def render_sidebar():
            
 
 render_sidebar()
+
+if st.session_state.view == "user_videos":
+    if st.button("⬅️ Back to Chatbot", key="back_user_vids"):
+        st.session_state.view = "chat"
+        st.rerun()
+
+    st.markdown("## 👤 My Assigned Videos")
+    q = st.text_input("Search videos (title / description / tags)", key="video_search", placeholder="e.g., anxiety, breathing")
+    params = {"q": q} if q else None
+    with st.spinner("Loading videos…"):
+        rv = api_get("/videos", params=params)
+    videos = rv.json() if (rv is not None and rv.status_code == 200) else []
+    # st.json(videos)
+
+    my_id = str(st.session_state.user_id)  
+    # st.markdown(my_id)# always string
+    my_videos = [v for v in videos if v.get("access") == f"user:{my_id}"]
+
+    if not my_videos:
+        st.info("No videos assigned to you yet.")
+        st.stop()
+
+    cols_per_row = 2
+    for i in range(0, len(my_videos), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            idx = i + j
+            if idx >= len(my_videos): break
+            v = my_videos[idx]
+            with col:
+                st.video(v["url"])
+                st.markdown(f"**{v['title']}**")
+                if v.get("description"): st.caption(v["description"])
+                if v.get("tags"): st.caption("Tags: " + ", ".join(v["tags"]))
+                st.caption(f"Added by: {v.get('added_by', 'unknown')}")
+    st.stop()
+
+
+# ---------------- Counsellor: All videos ----------------
+if st.session_state.view == "counsellor_videos_all":
+    # Back button (small)
+    if st.button("⬅️ Back to Chatbot", key="cback_all"):
+        st.session_state.view = "counsellor"
+        st.rerun()
+
+    st.markdown("## 🌍 All Video Gallery")
+
+    # --- Add new video (visible to all users) ---
+    with st.expander("➕ Add Video for All Users", expanded=False):
+        with st.form("counsellor_add_common_video", clear_on_submit=True):
+            title = st.text_input("Video Title")
+            url = st.text_input("YouTube URL")
+            desc = st.text_area("Description", height=100)
+            tags = st.text_input("Tags (comma-separated)")
+            submitted = st.form_submit_button("Add Video")
+
+            if submitted:
+                payload = {
+                    "title": title,
+                    "url": url,
+                    "description": desc or "",
+                    "tags": [t.strip() for t in (tags or "").split(",") if t.strip()],
+                    "is_public": True,
+                    "target_user_id": None
+                }
+                resp = api_post("/counsellor/videos", json=payload)
+                if resp and resp.status_code in (200, 201):
+                    st.success("Video added for all users.")
+                    st.rerun()
+                else:
+                    st.error("Failed to add video.")
+
+    # --- Search ---
+    q = st.text_input("Search videos (title / description / tags)", key="counsellor_all_video_search")
+    params = {"q": q} if q else None
+    rv = api_get("/videos", params=params)
+    videos = rv.json() if (rv and rv.status_code == 200) else []
+    videos_all = [v for v in videos if v.get("access") == "all"]
+
+    if not videos_all:
+        st.info("No videos for all users yet.")
+        st.stop()
+
+    # Render as 2-column grid with YouTube players
+    cols_per_row = 2
+    for i in range(0, len(videos_all), cols_per_row):
+        cols = st.columns(cols_per_row)
+        for j, col in enumerate(cols):
+            idx = i + j
+            if idx >= len(videos_all): break
+            v = videos_all[idx]
+            with col:
+                st.video(v["url"])
+                st.markdown(f"**{v['title']}**")
+                if v.get("description"): st.caption(v["description"])
+                if v.get("tags"): st.caption("Tags: " + ", ".join(v["tags"]))
+                st.caption(f"Added by: {v.get('added_by', 'unknown')}")
+                if st.session_state.get("is_counsellor", False):
+                    if st.button("🗑️ Delete", key=f"del_all_{v['id']}"):
+                        rr = api_delete(f"/counsellor/videos/{v['id']}") or api_delete(f"/admin/videos/{v['id']}")
+                        if rr and rr.status_code in (200, 204):
+                            st.success("Deleted.")
+                            st.rerun()
+                        else:
+                            st.error("Delete failed")
+
+    st.stop()
+
+
+# ---------------- Counsellor: User-specific videos ----------------
+if st.session_state.view == "counsellor_videos_users":
+    if st.button("⬅️ Back to Chatbot", key="cback_users"):
+        st.session_state.view = "counsellor"
+        st.rerun()
+
+    st.markdown("## 👤 User Video Gallery")
+
+    # --- Add new video for a user ---
+    with st.expander("➕ Add Video for Specific User", expanded=False):
+        r = api_get("/counsellor/users")
+        user_choices = {u["email"]: u["id"] for u in r.json()} if r and r.status_code == 200 else {}
+
+        with st.form("counsellor_add_user_video", clear_on_submit=True):
+            choice = st.selectbox("Select User", list(user_choices.keys())) if user_choices else None
+            title = st.text_input("Video Title")
+            url = st.text_input("YouTube URL")
+            desc = st.text_area("Description", height=100)
+            tags = st.text_input("Tags (comma-separated)")
+            submitted = st.form_submit_button("Add Video")
+
+            if submitted and choice:
+                user_id = user_choices[choice]
+                payload = {
+                    "title": title,
+                    "url": url,
+                    "description": desc or "",
+                    "tags": [t.strip() for t in (tags or "").split(",") if t.strip()],
+                    "is_public": False,
+                    "target_user_id": int(user_id)   # must be int, not str
+                }
+                resp = api_post("/counsellor/videos", json=payload)
+                if resp and resp.status_code in (200, 201):
+                    st.success(f"Video added for {choice}")
+                    st.rerun()
+                else:
+                    st.error("Failed to add video.")
+
+    # --- Search ---
+    q = st.text_input("Search user videos", key="counsellor_user_video_search")
+    rv = api_get("/videos")
+    all_videos = rv.json() if (rv and rv.status_code == 200) else []
+    user_vids = [v for v in all_videos if v.get("access", "").startswith("user:")]
+
+    if q:
+        ql = q.lower()
+        user_vids = [v for v in user_vids if ql in v.get("title", "").lower() or ql in (v.get("description") or "").lower()]
+
+    if not user_vids:
+        st.info("No user-specific videos yet.")
+        st.stop()
+
+    # Fetch map of user_id → email (use counsellor endpoint)
+    users_resp = api_get("/counsellor/users")
+    user_map = {str(u["id"]): u["email"] for u in users_resp.json()} if users_resp and users_resp.status_code == 200 else {}
+
+    # --- Render table ---
+    st.markdown("### 📋 Videos Assigned to Users")
+    header = st.columns([3, 3, 3, 1])
+    header[0].markdown("**User**")
+    header[1].markdown("**Title**")
+    header[2].markdown("**Video**")
+    header[3].markdown("**Action**")
+
+    for v in user_vids:
+        uid = v["access"].split("user:")[-1]
+        uname = user_map.get(uid, f"User {uid}")
+        cols = st.columns([3, 3, 3, 1])
+        with cols[0]:
+            st.write(uname)
+        with cols[1]:
+            st.write(v["title"])
+        with cols[2]:
+            st.markdown(f"[Watch Video]({v['url']})")
+        with cols[3]:
+                if st.session_state.get("is_counsellor", False):
+                    if st.button("🗑️", key=f"del_user_{v['id']}"):
+                        rr = api_delete(f"/counsellor/videos/{v['id']}") or api_delete(f"/admin/videos/{v['id']}")
+                        if rr and rr.status_code in (200, 204):
+                            st.success("Deleted.")
+                            st.rerun()
+                        else:
+                            st.error("Delete failed")
+
+    st.stop()
 
 if st.session_state.view == "manage_counsellors":
     st.header("👥 Manage Counsellors")
@@ -1221,31 +1434,26 @@ if st.session_state.view == "videos":
     with st.spinner("Loading videos…"):
         rv = api_get("/videos", params=params)
     videos = rv.json() if (rv is not None and rv.status_code == 200) else []
+    videos_all = [v for v in videos if v.get("access") == "all"]
 
-    if not videos:
+    if not videos_all:
         st.info("No videos found.")
         st.stop()
 
-    # Render in a responsive 2-column grid
-    def render_tags(tags: list[str]):
-        if not tags: return
-        st.markdown(" ".join([f"<span style='padding:2px 8px;border:1px solid #444;border-radius:12px;font-size:12px;margin-right:4px;display:inline-block'>{t}</span>" 
-                              for t in tags]), unsafe_allow_html=True)
-
+        # Render as 2-column grid with YouTube players
     cols_per_row = 2
-    for i in range(0, len(videos), cols_per_row):
+    for i in range(0, len(videos_all), cols_per_row):
         cols = st.columns(cols_per_row)
         for j, col in enumerate(cols):
             idx = i + j
-            if idx >= len(videos): break
-            v = videos[idx]
+            if idx >= len(videos_all): break
+            v = videos_all[idx]
             with col:
                 st.video(v["url"])
                 st.markdown(f"**{v['title']}**")
-                if v.get("description"):
-                    st.caption(v["description"])
-                render_tags(v.get("tags", []))
-                st.caption(f"Added by: {v.get('added_by','admin')}  •  Platform: {v.get('platform','youtube').title()}  •  Visibility: {'Public' if v.get('is_public') else 'Hidden'}")
+                if v.get("description"): st.caption(v["description"])
+                if v.get("tags"): st.caption("Tags: " + ", ".join(v["tags"]))
+                st.caption(f"Added by: {v.get('added_by', 'unknown')}")
                 # admin controls
                 if st.session_state.is_admin:
                     c1, c2 = st.columns([1,1])
