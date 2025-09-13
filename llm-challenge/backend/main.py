@@ -1842,7 +1842,7 @@ def counsellor_list_users(user=Depends(get_current_user), db: Session = Depends(
 def grant_access(body: AccessCreate, user=Depends(get_current_user), db: Session = Depends(get_db)):
     if is_admin_principal(user):
         raise HTTPException(status_code=403, detail="Admins cannot grant access.")
-    # verify counsellor exists
+    # Verify counselor exists
     c = db.query(User).filter(User.id == body.counsellor_id, User.is_counsellor == 1).first()
     if not c:
         raise HTTPException(status_code=404, detail="Counsellor not found")
@@ -1853,9 +1853,27 @@ def grant_access(body: AccessCreate, user=Depends(get_current_user), db: Session
         existing.allow_chats = 1 if body.allow_chats else 0
         existing.allow_q_chats = 1 if body.allow_q_chats else 0
         existing.allow_dashboard = 1 if body.allow_dashboard else 0
-        db.commit(); db.refresh(existing)
+        db.commit()
+        db.refresh(existing)
+
+        # Send email notification for updated access
+        send_email(
+            to_email=c.email,
+            subject="Access Updated",
+            html_body=f"""
+            <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+                <h2>Access Updated</h2>
+                <p>User <b>{user.email}</b> has updated your access permissions:</p>
+                <ul>
+                    <li>Chats: {"Granted" if body.allow_chats else "Revoked"}</li>
+                    <li>Dashboard: {"Granted" if body.allow_dashboard else "Revoked"}</li>
+                </ul>
+            </div>
+            """
+        )
         return {"ok": True, "id": existing.id, "updated": True}
 
+    # Create a new access record
     acc = UserAccess(
         user_id=user.id,
         counsellor_id=body.counsellor_id,
@@ -1863,7 +1881,26 @@ def grant_access(body: AccessCreate, user=Depends(get_current_user), db: Session
         allow_q_chats=1 if body.allow_q_chats else 0,
         allow_dashboard=1 if body.allow_dashboard else 0,
     )
-    db.add(acc); db.commit(); db.refresh(acc)
+    db.add(acc)
+    db.commit()
+    db.refresh(acc)
+
+    # Send email notification for granted access
+    send_email(
+        to_email=c.email,
+        subject="Access Granted",
+        html_body=f"""
+        <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+            <h2>Access Granted</h2>
+            <p>User <b>{user.email}</b> has granted you access to the following:</p>
+            <ul>
+                <li>Chats: {"Granted" if body.allow_chats else "Not Granted"}</li>
+                <li>Questionnaire Chats: {"Granted" if body.allow_q_chats else "Not Granted"}</li>
+                <li>Dashboard: {"Granted" if body.allow_dashboard else "Not Granted"}</li>
+            </ul>
+        </div>
+        """
+    )
     return {"ok": True, "id": acc.id}
 
 
@@ -1901,7 +1938,27 @@ def delete_my_access(access_id: int, user=Depends(get_current_user), db: Session
     acc = db.query(UserAccess).filter(UserAccess.id == access_id, UserAccess.user_id == user.id).first()
     if not acc:
         raise HTTPException(status_code=404, detail="Access record not found")
-    db.delete(acc); db.commit()
+
+    # Get the counselor's email before deleting the record
+    c = db.query(User).filter(User.id == acc.counsellor_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="Counsellor not found")
+
+    # Delete the access record
+    db.delete(acc)
+    db.commit()
+
+    # Send email notification for revoked access
+    send_email(
+        to_email=c.email,
+        subject="Access Revoked",
+        html_body=f"""
+        <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+            <h2>Access Revoked</h2>
+            <p>User <b>{user.email}</b> has revoked your access permissions.</p>
+        </div>
+        """
+    )
     return {"ok": True}
 
 # -------- Counsellor: view grants given to them --------
@@ -2049,17 +2106,17 @@ def request_access(
     return {"ok": True, "msg": "Request sent", "request_id": req.id}
 
 
-def send_email(to_email: str, subject: str, body: str):
-    """Send a simple email via MailHog SMTP"""
-    msg = MIMEText(body, "plain")
-    msg["From"] = "noreply@Psych.com"
-    msg["To"] = to_email
-    msg["Subject"] = subject
+# def send_email(to_email: str, subject: str, body: str):
+#     """Send a simple email via MailHog SMTP"""
+#     msg = MIMEText(body, "plain")
+#     msg["From"] = "noreply@Psych.com"
+#     msg["To"] = to_email
+#     msg["Subject"] = subject
 
-    try:
-        with smtplib.SMTP("mailhog", 1025) as server:  # "localhost" if not in docker
-            server.sendmail(msg["From"], [to_email], msg.as_string())
-        return True
-    except Exception as e:
-        print("Email send failed:", e)
-        return False
+#     try:
+#         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:  # "localhost" if not in docker
+#             server.sendmail(msg["From"], [to_email], msg.as_string())
+#         return True
+#     except Exception as e:
+#         print("Email send failed:", e)
+#         return False

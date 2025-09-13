@@ -408,8 +408,7 @@ def api_delete(path: str, timeout=60):
         return None
 
 def api_request_access_mail(user_id: int, access_type: str):
-    return api_post("/counsellor/request-access", {"user_id": user_id, "type": access_type})
-
+    return api_post("/counsellor/request-access", {"user_id": user_id, "request_type": access_type})
 # user access helpers
 def api_user_post_access(json_body):
     return api_post("/user/access", json=json_body)
