@@ -84,7 +84,7 @@ LOCAL_TZ = ZoneInfo("Asia/Kolkata")
 ENABLE_EMAIL_SCHEDULER = os.getenv("ENABLE_EMAIL_SCHEDULER", "1") == "1"
 
 # Questionnaire rules
-MIN_QUESTIONS = 7          # minimum to reach before offering score
+MIN_QUESTIONS = 10          # minimum to reach before offering score
 CONTINUE_STEP = 3            # increment each time user says "continue"
 
 # ---------------- DB ----------------
@@ -351,7 +351,7 @@ def users_without_any_attempts(db: Session) -> list[User]:
         db.query(User)
         .outerjoin(QuestionnaireAttempt, QuestionnaireAttempt.user_id == User.id)
         .group_by(User.id)
-        .having(func.count(QuestionnaireAttempt.id) == 0)
+        .having(func.count(QuestionnaireAttempt.id) == 0, User.is_counsellor == 0)
         .all()
     )
 
@@ -364,6 +364,7 @@ def attempts_for_user_on_day(db: Session, user_id: int, day_str: str) -> list[Qu
         db.query(QuestionnaireAttempt)
         .filter(QuestionnaireAttempt.user_id == user_id, QuestionnaireAttempt.day == day_str)
         .order_by(QuestionnaireAttempt.created_at.asc())
+        .having(User.is_counsellor == 0)
         .all()
     )
 
@@ -372,6 +373,7 @@ def attempts_for_user_all(db: Session, user_id: int) -> list[QuestionnaireAttemp
         db.query(QuestionnaireAttempt)
         .filter(QuestionnaireAttempt.user_id == user_id)
         .order_by(QuestionnaireAttempt.created_at.asc())
+        .having(User.is_counsellor == 0)
         .all()
     )
 

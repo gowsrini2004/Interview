@@ -760,7 +760,7 @@ def render_sidebar():
                     st.rerun()
             
             with st.expander("🗨 Forum", expanded=False):
-                if st.button("Enter Forum"):
+                if st.button("🗨  View Open Topics"):
                     st.session_state.view = "forum"
 
             # NOTE: Questionnaire & Your Chats are intentionally hidden for Admin.
@@ -940,8 +940,8 @@ def render_sidebar():
                     st.session_state.view = "yoga"
                     st.rerun()
             with st.expander("🗨 Forum", expanded=False):
-                if st.button("Enter Forum"):
-                    st.session_state.view = "forum"
+                if st.button("🗨  View Open Topics"):
+                    st.session_state.view = "forum" 
 
 
 
@@ -1111,7 +1111,7 @@ def render_sidebar():
                     st.rerun()
             
             with st.expander("🗨 Forum", expanded=False):
-                if st.button("Enter Forum"):
+                if st.button("🗨  View Open Topics"):
                     st.session_state.view = "forum"
 
            
@@ -1375,24 +1375,26 @@ if st.session_state.view == "forum":
     st.title("🗨 Forum")
 
     # --- Create Topic in Expander ---
-    with st.expander("➕ Create a New Topic", expanded=False):
-        title = st.text_input("Title", key="forum_new_title")
-        content = st.text_area("Content", key="forum_new_content")
-        forum_type = "user"
-        if st.session_state.is_counsellor:
-            forum_type = st.selectbox("Forum Type", ["user", "counsellor"], key="forum_new_type")
+    #adding cab done only by users and counsellors
+    if not st.session_state.get("is_admin"):
+        with st.expander("➕ Create a New Topic", expanded=False):
+            title = st.text_input("Title", key="forum_new_title")
+            content = st.text_area("Content", key="forum_new_content")
+            forum_type = "user"
+            if st.session_state.is_counsellor:
+                forum_type = st.selectbox("Forum Type", ["user", "counsellor"], key="forum_new_type")
 
-        if st.button("Post", key="forum_post_btn"):
-            r = api_post("/forum/topics", json={
-                "title": title,
-                "content": content,
-                "type": forum_type
-            })
-            if r and r.status_code == 200:
-                st.success("✅ Topic created!")
-                st.rerun()
+            if st.button("Post", key="forum_post_btn"):
+                r = api_post("/forum/topics", json={
+                    "title": title,
+                    "content": content,
+                    "type": forum_type
+                })
+                if r and r.status_code == 200:
+                    st.success("✅ Topic created!")
+                    st.rerun()
 
-    st.markdown("---")
+        st.markdown("---")
 
     st.subheader("📋 Forum Topics")
     r = api_get("/forum/topics")
@@ -1560,8 +1562,8 @@ if st.session_state.view == "appointments":
                         st.success("Appointment deleted.")
                     else:
                         st.error("Delete failed.")
-                    st.query_params(refresh=str(datetime.now().timestamp()))
-
+                    st.query_params["refresh"] = str(datetime.now().timestamp())
+                    st.rerun()
         with tab_future:
             st.subheader("Future Appointments")
             future = [
