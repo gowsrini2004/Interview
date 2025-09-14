@@ -59,15 +59,8 @@ This is not just a chatbot — it is a **psychological support dashboard** where
   - Automatic reminder emails are sent **24 hours before** and **12 hours before** the appointment.  
 - Both **user and counselor** receive reminders.  
 
----
 
-## ⚙️ Setup & Deployment Guide (Windows)  
 
-Follow these steps to set up the application on a Windows machine.  
-
----
-
-### 1. Python Environment Setup  
 
 ```bash
 cd Interview\llm-challenge
