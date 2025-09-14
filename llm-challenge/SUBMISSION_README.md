@@ -1,203 +1,76 @@
-🧠 Psych Support LLM Chatbot
-The Psych Support LLM Chatbot is a holistic psychology support application designed to provide a comprehensive blend of AI-driven interaction, structured self-assessment, wellness features, and direct access to human counseling. This system is architected with modern technologies to be a complete ecosystem for users, counselors, and administrators, ensuring scalability, security, and extensibility.
+# Psych Support — LLM Chatbot  
 
-📸 Showcase
-📚 Table of Contents
-📋 Key Features
+The **Psych Support — LLM Chatbot** is a complete mental health support system that combines **LLM-based AI chat**, **RAG-based knowledge retrieval**, and **human counselor consultation** into a single platform.  
 
-🛠️ Technology Stack
+This is not just a chatbot — it is a **psychological support dashboard** where:  
+- **Users** can interact with an AI, complete wellness questionnaires, practice meditation & yoga, watch videos, join forums, and book consultations with counselors.  
+- **Counselors** can monitor user progress (with user consent), assign videos, manage appointments, and host counselor-only forums.  
+- **Admins** have full control over users, content, and system utilities.  
 
-⚙️ Setup and Deployment (Windows)
+---
 
-🚀 Accessing the Services
+## 🏗️ Architecture & Tech Stack  
 
-🧑‍💻 How to Use
+- **Frontend** → Streamlit (simple, responsive UI with sidebar navigation).  
+- **Backend** → FastAPI (Python, provides APIs, authentication, mailing).  
+- **Database** → PostgreSQL (stores login details, users, appointments, forum topics).  
+- **Vector Database** → Qdrant (stores embeddings for Retrieval-Augmented Generation).  
+- **Authentication** → JWT tokens for secure session management.  
+- **Mailing** → MailHog (used for email notifications & reminders).  
+- **LLM Providers**:  
+  - **GROQ API** (fast, online, API-based).  
+  - **OLLAMA–Mistral** (local containerized model, slower but offline).  
+- **Deployment** → Docker (`base.yml` and `llm.yml` compose services).  
 
-📋 Key Features
-The application provides distinct functionalities based on user roles:
+---
 
-👤 For Users
-💬 AI Chat: Engage with an AI that provides contextual answers from a knowledge base.
+## 📑 Features  
 
-📝 Daily Questionnaires: Complete adaptive daily questionnaires to track mood and well-being.
+### 🔹 Admin Module  
+- **User Management** → View, search, clear chats/questionnaires, reset passwords, delete users.  
+- **Utilities** → Upload or clear documents in VectorDB for chatbot context.  
+- **Email Tool** → Send reminders, daily scores, or monthly summaries to users.  
+- **Video Library** → Add/delete videos accessible by all users.  
+- **Manage Counselors** → Promote/demote users, edit counselor details, or delete counselors.  
+- **Forum** → View/create/delete topics.  
 
-🧘 Wellness Tools: Access guided meditations, calming audio, and curated yoga videos.
+### 🔹 User Module  
+- **Chatbot** → Context-aware chat with RAG sources and out-of-context warnings.  
+- **Questionnaire** → Daily wellness questions, automated scoring, and dashboards.  
+- **Videos** → Access global videos (admin/counselor uploads) and assigned videos.  
+- **Meditate** → Guided meditation steps (AI-generated) with audio + meditation room.  
+- **Yoga** → Curated videos by type (basic, advanced, surya namaskara, pranayama, flexibility).  
+- **Forum** → Create/join discussions accessible to all.  
+- **Consultation** → Book appointments with counselors, view today/future/closed appointments.  
 
-🎬 Video Library: Watch curated or personally assigned videos.
+### 🔹 Counselor Module  
+- **Utility** → Upload documents to VectorDB for users, choose LLM provider, streaming toggle.  
+- **User Chats & Questionnaires** → View only if user grants permission; can request access.  
+- **Appointments** → Accept/reject requests, add meeting links, create appointments directly, close sessions with reports.  
+- **Video Gallery** → Add videos globally or assign videos to specific users.  
+- **Shared Tools** → Access Chat, Meditate, and Yoga features like normal users.  
+- **Forum** → Create topics in public or counselor-only forums.  
 
-🌐 Community Forum: Participate in public forum discussions.
+---
 
-🗓️ Counselor Appointments: Book and manage appointments with counselors.
+## 📬 Appointment Notifications  
 
-🔒 Privacy Control: Grant or revoke counselor access to your data.
+- For every scheduled appointment (user- or counselor-created):  
+  - Automatic reminder emails are sent **24 hours before** and **12 hours before** the appointment.  
+- Both **user and counselor** receive reminders.  
 
-👨‍⚕️ For Counselors
-📊 User Monitoring: View chat histories and questionnaire dashboards of users who grant access.
+---
 
-✅ Appointment Management: Approve, reject, and manage appointments.
+## ⚙️ Setup & Deployment Guide (Windows)  
 
-📚 Content Curation: Upload documents to enhance the chatbot's knowledge base.
+Follow these steps to set up the application on a Windows machine.  
 
-🔒 Private Forum: Participate in a private forum visible only to other counselors.
+---
 
-👑 For Administrators
-👥 Full User Management: View, search, and manage all user accounts.
+### 1. Python Environment Setup  
 
-⚙️ System Utilities: Manage the entire VectorDB and knowledge base.
-
-⬆️ Counselor Promotion: Promote standard users to the counselor role.
-
-🎥 Global Content Management: Add or delete videos from the global library.
-
-📧 Email Tools: Trigger automated reminder and summary emails to users.
-
-🛠️ Technology Stack
-The application is built using a modern and reliable architecture:
-
-Category
-
-Technology
-
-Description
-
-Frontend
-
-Streamlit
-
-For building the interactive user interface.
-
-Backend
-
-FastAPI
-
-For creating a high-performance Python API.
-
-Database
-
-PostgreSQL
-
-For storing user data, appointments, etc.
-
-Vector DB
-
-Qdrant
-
-For Retrieval-Augmented Generation (RAG).
-
-Authentication
-
-JWT (JSON Web Tokens)
-
-For secure session management.
-
-LLM Providers
-
-GROQ & OLLAMA-Mistral
-
-For fast cloud and reliable local model options.
-
-Mailing
-
-MailHog
-
-For handling and viewing development emails.
-
-Deployment
-
-Docker
-
-For containerizing and isolating services.
-
-⚙️ Setup and Deployment (Windows)
-This guide explains how to set up and run the chatbot on a Windows machine.
-
-Prerequisites
-Python 3.x
-
-Docker Desktop
-
-1. Python Environment Setup
-First, set up a dedicated Python virtual environment.
-
-Open Command Prompt or PowerShell and navigate to the project folder:
-
+```bash
 cd Interview\llm-challenge
-
-Create a virtual environment:
-
 python -m venv venv
-
-Activate the environment:
-
 venv\Scripts\activate
-
-Install all required packages:
-
 pip install -r requirements.txt
-
-2. Configure Environment Variables
-Place the .env file you received via email into the backend directory: Interview\llm-challenge\backend\.env
-
-3. Start Docker Containers
-Run the Docker startup script:
-
-start-llm.sh
-
-Verify that the containers are running:
-
-docker ps
-
-4. Set Up the Local LLM (Mistral)
-Run the following commands to pull and run the Mistral model inside the OLLAMA container:
-
-docker exec -it interview_ollama ollama pull mistral
-docker exec -it interview_ollama ollama run mistral
-
-5. Run the Application
-Start the Backend
-
-In a new terminal, navigate to the backend folder:
-
-cd Interview\llm-challenge\backend
-
-Run the FastAPI server:
-
-python -m uvicorn main:app --reload
-
-Wait for the confirmation message Application startup complete before proceeding.
-
-Start the Frontend
-
-Open another new terminal.
-
-Navigate to the frontend folder:
-
-cd Interview\llm-challenge\frontend
-
-Run the Streamlit application:
-
-streamlit run app.py
-
-🚀 Accessing the Services
-Once all steps are complete, the services will be available at the following URLs:
-
-Frontend Application: The Streamlit app will open automatically in your browser.
-
-Backend API: http://127.0.0.1:8000
-
-MailHog (Email Viewer): http://localhost:8025/
-
-🧑‍💻 How to Use
-First-Time Users
-Registration: New users must register with a valid email address.
-
-Login: After registering, you can log in with your credentials.
-
-Initial Delay: The first load may be slow as the VectorDB and embedder models initialize.
-
-Admin Access
-To log in as an administrator, use the following credentials directly on the login page:
-
-Email: admin
-
-Password: admin
